@@ -329,6 +329,7 @@ STATUS = {
     "not_started": "00.未開始",
     "in_progress": "10.実行中",
     "reviewing":   "20.レビュー中",
+    "sir":         "SIR",
     "complete":    "30.完了",
     "cancelled":   "99.キャンセル",
 }
@@ -371,11 +372,16 @@ def find_files(folder: str) -> tuple[str | None, list[str]]:
     """
     cycle_list = None
     scripts = []
+    root = Path(folder)
 
-    for f in Path(folder).iterdir():
-        if not f.suffix.lower() == ".xlsx":
-            continue
+    for f in root.rglob("*.xlsx"):
         if f.name.startswith("~$"):  # skip Excel temp/lock files
+            continue
+
+        # Skip files inside any subfolder whose name contains "old" or "旧" (case-insensitive)
+        relative_parts = f.relative_to(root).parts[:-1]  # intermediate folder names only
+        if any("old" in part.lower() or "旧" in part for part in relative_parts):
+            log.debug(f"Skipping (old/旧 folder): {f}")
             continue
 
         name = f.name
@@ -473,6 +479,7 @@ def analyze_script(filepath: str) -> dict | None:
     completed = 0
     has_ng = False
     actual_dates = []
+    ok_steps_missing_date = 0  # OK steps with no actual date (for all_dates_filled)
     planned_dates = []
     executors = set()
 
@@ -535,6 +542,8 @@ def analyze_script(filepath: str) -> dict | None:
             if actual and isinstance(actual, (datetime, date)):
                 d = actual.date() if isinstance(actual, datetime) else actual
                 actual_dates.append(d)
+            else:
+                ok_steps_missing_date += 1
         elif result == "NG":
             has_ng = True
 
@@ -548,6 +557,7 @@ def analyze_script(filepath: str) -> dict | None:
         "has_ng":            has_ng,
         "first_actual_date": min(actual_dates)  if actual_dates  else None,
         "last_actual_date":  max(actual_dates)  if actual_dates  else None,
+        "all_dates_filled":  completed > 0 and ok_steps_missing_date == 0,
         "executor":          ", ".join(sorted(executors)) if executors else None,
         "earliest_planned":  min(planned_dates) if planned_dates else None,
     }
@@ -588,16 +598,22 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
         # Skip deleted cycles (col 9 = deletion flag, NOT col 8 which is regression flag)
         if row[c["deletion_flag"]].value == "X":
             continue
+
+        # Skip cancelled cycles — automation must not overwrite their status
+        current_status = row[c["exec_status"]].value or STATUS["not_started"]
+        if current_status == STATUS["cancelled"]:
+            continue
+
         result = script_results.get(cycle_id)
         if not result:
             continue  # no matching script found for this cycle
 
-        current_status = row[c["exec_status"]].value or STATUS["not_started"]
-
         # Determine new status
         if result["all_ok"]:
             new_status = STATUS["complete"]
-        elif result["completed_steps"] > 0 or result["has_ng"]:
+        elif result["has_ng"]:
+            new_status = STATUS["sir"]
+        elif result["completed_steps"] > 0:
             new_status = STATUS["in_progress"]
         else:
             new_status = STATUS["not_started"]
@@ -614,8 +630,8 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
             row[c["actual_start"]].value = result["first_actual_date"]
             row_changed = True
 
-        # actual end date — only set when all OK and currently blank
-        if result["all_ok"] and result["last_actual_date"] and not row[c["actual_end"]].value:
+        # actual end date — only set when all OK, all actual dates present, and currently blank
+        if result["all_ok"] and result["all_dates_filled"] and result["last_actual_date"] and not row[c["actual_end"]].value:
             row[c["actual_end"]].value = result["last_actual_date"]
             row_changed = True
 
