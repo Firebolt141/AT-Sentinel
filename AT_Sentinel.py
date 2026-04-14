@@ -284,6 +284,10 @@ CONFIG = {
     # How to find it: open the Teams channel → click ••• → "Get email address"
     # Leave blank ("") to disable Teams notifications even if "teams" is listed above.
     "teams_channel_email": "",
+
+    # Dry-run mode: compute all changes but do NOT write the cycle list or send any
+    # notifications. Useful for validating what the automation would do before going live.
+    "dry_run": False,
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -482,6 +486,7 @@ def analyze_script(filepath: str) -> dict | None:
     ok_steps_missing_date = 0  # OK steps with no actual date (for all_dates_filled)
     planned_dates = []
     executors = set()
+    last_step_no = None  # carries the step number forward across merged-cell rows
 
     for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
         if row_idx < SCRIPT_HEADER_ROWS:
@@ -499,9 +504,15 @@ def analyze_script(filepath: str) -> dict | None:
         if len(row) > c["excluded"] and row[c["excluded"]] == "X":
             continue
 
-        # A valid test step has EITHER a step number (col 1) OR test result data
-        # Handles merged cells where step number only appears in the first merged row
-        has_step_no = row[1] is not None
+        # Carry the step number forward across merged-cell rows.
+        # In a merged step group only the anchor row has a value in col 1;
+        # subsequent rows return None.  Updating last_step_no here ensures
+        # every row in the group is treated as a valid step, even when untouched
+        # (no result data yet).
+        step_no = row[1] if len(row) > 1 else None
+        if step_no is not None:
+            last_step_no = step_no
+        has_step_no = last_step_no is not None
         has_result_data = (
             len(row) > c["result"] and row[c["result"]] in ("OK", "NG", "-")
         ) or (
@@ -531,7 +542,7 @@ def analyze_script(filepath: str) -> dict | None:
         # Determine result — retest takes priority over first run
         retest_result = row[c["retest_result"]] if len(row) > c["retest_result"] else None
         first_result  = row[c["result"]]         if len(row) > c["result"]         else None
-        result = retest_result if retest_result and retest_result != "-" else first_result
+        result = retest_result if retest_result and retest_result.strip() not in ("", "-") else first_result
 
         retest_date = row[c["retest_date"]] if len(row) > c["retest_date"] else None
         first_date  = row[c["actual_date"]] if len(row) > c["actual_date"] else None
@@ -566,10 +577,14 @@ def analyze_script(filepath: str) -> dict | None:
 # ─────────────────────────────────────────────────────────────
 # CYCLE LIST UPDATE
 # ─────────────────────────────────────────────────────────────
-def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> list[dict]:
+def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> tuple[list[dict], list[dict]]:
     """
     Open the Test Cycle List, update status/dates/counts from script results,
-    save in place. Returns list of changed rows for the report.
+    save in place (unless dry_run is set in CONFIG).
+
+    Returns (changes, missing_scripts):
+      changes         — rows that were updated
+      missing_scripts — active, non-cancelled cycles that have no matching script file
 
     IMPORTANT: We use load_workbook without data_only so formulas are preserved.
     We ONLY write to columns that contain plain values (not formulas).
@@ -579,7 +594,9 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
     ws = wb["テストサイクル一覧"]
     c = CYCLE_COLS
     today = date.today()
-    changes = []
+    changes: list[dict] = []
+    missing_scripts: list[dict] = []
+    seen_ids: set[str] = set()
 
     for row in ws.iter_rows(min_row=CYCLE_HEADER_ROWS + 1):
         # Reconstruct cycle ID from area + seq_no (col 0 is a formula openpyxl can't evaluate)
@@ -604,9 +621,23 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
         if current_status == STATUS["cancelled"]:
             continue
 
+        # Warn and skip if two rows reconstruct to the same cycle ID
+        if cycle_id in seen_ids:
+            log.warning(f"Duplicate cycle ID '{cycle_id}' in cycle list — skipping row")
+            continue
+        seen_ids.add(cycle_id)
+
         result = script_results.get(cycle_id)
         if not result:
-            continue  # no matching script found for this cycle
+            # Active cycle with no matching condition script — surface for review
+            missing_scripts.append({
+                "cycle_id":   cycle_id,
+                "cycle_name": row[c["cycle_name"]].value,
+                "area":       row[c["area"]].value,
+                "exec_status": current_status,
+                "executor":   row[c["executor"]].value,
+            })
+            continue
 
         # Determine new status
         if result["all_ok"]:
@@ -667,10 +698,15 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
                 "has_ng":          result["has_ng"],
             })
 
-    wb.save(cycle_list_path)
+    if CONFIG.get("dry_run"):
+        log.info(f"DRY RUN — cycle list NOT saved ({len(changes)} changes computed, "
+                 f"{len(missing_scripts)} missing scripts)")
+    else:
+        wb.save(cycle_list_path)
     wb.close()
-    log.info(f"Cycle list saved — {len(changes)} rows updated")
-    return changes
+    log.info(f"Cycle list updated — {len(changes)} rows changed, "
+             f"{len(missing_scripts)} cycles missing scripts")
+    return changes, missing_scripts
 
 
 # ─────────────────────────────────────────────────────────────
@@ -829,6 +865,10 @@ def notify(to_email: str | None, subject: str, body_html: str, *, post_to_teams:
     """
     channels = CONFIG.get("notify_channels", ["email"])
 
+    if CONFIG.get("dry_run"):
+        log.info(f"[DRY RUN] Skipping notification: to={to_email!r}, subject={subject!r}, teams={post_to_teams}")
+        return
+
     if "email" in channels and to_email:
         send_email_outlook(to_email, subject, body_html)
 
@@ -839,8 +879,10 @@ def notify(to_email: str | None, subject: str, body_html: str, *, post_to_teams:
 # ─────────────────────────────────────────────────────────────
 # REPORT BUILDER
 # ─────────────────────────────────────────────────────────────
-def build_manager_report(changes: list[dict], reminders: list[dict], today: date) -> str:
+def build_manager_report(changes: list[dict], reminders: list[dict], today: date,
+                          missing_scripts: list[dict] | None = None) -> str:
     """Build an HTML daily summary email for the manager."""
+    missing_scripts = missing_scripts or []
     completed = [c for c in changes if c["new_status"] == STATUS["complete"]]
     started   = [c for c in changes if c["new_status"] == STATUS["in_progress"]
                                     and c["old_status"] == STATUS["not_started"]]
@@ -864,7 +906,8 @@ def build_manager_report(changes: list[dict], reminders: list[dict], today: date
       <b>🚀 Newly started:</b> {len(started)} &nbsp;|&nbsp;
       <b>🔴 Overdue:</b> {len(overdue)} &nbsp;|&nbsp;
       <b>⏰ Stalled:</b> {len(stalled)} &nbsp;|&nbsp;
-      <b>📅 Upcoming ({CONFIG['reminder_days_ahead']}d):</b> {len(upcoming)}
+      <b>📅 Upcoming ({CONFIG['reminder_days_ahead']}d):</b> {len(upcoming)} &nbsp;|&nbsp;
+      <b>⚠️ No script:</b> {len(missing_scripts)}
     </p>
     """
 
@@ -908,6 +951,15 @@ def build_manager_report(changes: list[dict], reminders: list[dict], today: date
               f"{c['completed_steps']}/{c['total_steps']}", c["executor"] or "-")
              for c in started],
             ["Cycle ID", "Name", "Area", "Steps", "Executor"]
+        )
+
+    if missing_scripts:
+        html += "<h3 style='color:#b8860b'>⚠️ No Script File Found</h3>"
+        html += table(
+            [(m["cycle_id"], m["cycle_name"], m["area"] or "-",
+              m["exec_status"] or "-", m["executor"] or "-")
+             for m in missing_scripts],
+            ["Cycle ID", "Name", "Area", "Current Status", "Executor"]
         )
 
     html += "<br><p style='color:gray;font-size:11px'>Generated automatically by SAP Test Automation</p></div>"
@@ -989,7 +1041,11 @@ def run():
 
     # 3. Update cycle list
     log.info("Updating Test Cycle List...")
-    changes = update_cycle_list(cycle_list_path, script_results)
+    changes, missing_scripts = update_cycle_list(cycle_list_path, script_results)
+    if missing_scripts:
+        log.warning(f"{len(missing_scripts)} active cycle(s) have no matching script:")
+        for m in missing_scripts:
+            log.warning(f"  No script: {m['cycle_id']}  ({m['cycle_name']})")
     # OneDrive will auto-sync the updated file to SharePoint
 
     # 4. Get reminders
@@ -1023,7 +1079,7 @@ def run():
             notify(email, subject, body, post_to_teams=False)
 
     # 6. Send daily summary to manager (email + Teams channel)
-    report_html = build_manager_report(changes, reminders, today)
+    report_html = build_manager_report(changes, reminders, today, missing_scripts)
     notify(
         CONFIG["manager_email"],
         f"[SAP Test] Daily Report {today.strftime('%Y/%m/%d')} — "
