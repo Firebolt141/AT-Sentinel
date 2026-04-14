@@ -229,7 +229,6 @@ CHANGE LOG
 
 import json
 import os
-import io
 import re
 import logging
 from datetime import datetime, date, timedelta
@@ -295,44 +294,6 @@ CONFIG = {
     "active_profile": "AT-SAP",
 }
 
-# ─────────────────────────────────────────────────────────────
-# COLUMN INDICES (0-based) — from your actual files
-# ─────────────────────────────────────────────────────────────
-
-# テストサイクル一覧 sheet
-CYCLE_COLS = {
-    # NOTE: col 0 (テストサイクルID) is a formula ="AT1TC_"&H5&TEXT(C5,"000")
-    # We DO NOT read col 0 directly. Instead we reconstruct the ID from:
-    #   area (col 7) + seq_no (col 2) to match against script filenames.
-    "cycle_id":          0,   # テストサイクルID (formula — read via reconstruct_cycle_id)
-    "seq_no":            2,   # 領域内サイクル連番 (e.g. 1, 2, 3)
-    "cycle_name":        1,   # サイクル名称
-    "area":              7,   # 担当領域 (e.g. "SD/FI")
-    "regression_flag":   8,   # リグレッション対象フラグ (X = regression, NOT deletion)
-    "deletion_flag":     9,   # 削除フラグ (X = deleted, skip)
-    "plan_start_latest": 24,  # 実行開始予定日(最新)
-    "plan_end_latest":   25,  # 実行完了予定日(最新)
-    "actual_start":      26,  # 実行開始実績日
-    "actual_end":        27,  # 実行完了実績日
-    "executor":          32,  # 実行担当者
-    "exec_status":       33,  # 実行ステータス
-    "total_steps":       34,  # 総テストステップ数
-    "complete_steps":    35,  # 完了テストステップ数
-}
-
-# テスト仕様書兼結果記述書 sheet
-SCRIPT_COLS = {
-    "excluded":       8,   # テスト対象外 ('X' = skip this step)
-    "exec_pic":       25,  # 初回実行 担当者
-    "planned_date":   26,  # 初回実行 実行予定日
-    "actual_date":    27,  # 初回実行 実行日
-    "result":         28,  # 初回実行 テスト結果 (OK / NG / -)
-    "retest_pic":     30,  # 再実行 担当者
-    "retest_planned": 31,  # 再実行 実行予定日
-    "retest_date":    32,  # 再実行 実行日
-    "retest_result":  33,  # 再実行 テスト結果
-}
-
 # Execution status dropdown values (from the 'list' sheet)
 STATUS = {
     "not_started": "00.未開始",
@@ -342,11 +303,6 @@ STATUS = {
     "complete":    "30.完了",
     "cancelled":   "99.キャンセル",
 }
-
-# Header rows to skip in condition scripts (0-indexed rows 0-3 are headers, data starts row 4)
-SCRIPT_HEADER_ROWS = 4
-# Header rows to skip in cycle list (rows 0-2 are headers, data starts row 3)
-CYCLE_HEADER_ROWS = 3
 
 # ─────────────────────────────────────────────────────────────
 # PROFILES — per-test-stage / per-project configuration
@@ -692,7 +648,9 @@ def analyze_script(filepath: str, *, profile: dict | None = None) -> dict | None
         # Determine result — retest takes priority over first run
         retest_result = row[c["retest_result"]] if len(row) > c["retest_result"] else None
         first_result  = row[c["result"]]         if len(row) > c["result"]         else None
-        result = retest_result if retest_result and retest_result.strip() not in ("", "-") else first_result
+        result = (retest_result
+                  if isinstance(retest_result, str) and retest_result.strip() not in ("", "-")
+                  else first_result)
 
         retest_date = row[c["retest_date"]] if len(row) > c["retest_date"] else None
         first_date  = row[c["actual_date"]] if len(row) > c["actual_date"] else None
@@ -824,13 +782,17 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict], *,
             row[c["exec_status"]].value = new_status
             row_changed = True
 
-        # step counts — always sync
+        # step counts — always sync; flag row_changed when the numbers actually differ
+        if (row[c["total_steps"]].value    != result["total_steps"] or
+                row[c["complete_steps"]].value != result["completed_steps"]):
+            row_changed = True
         row[c["total_steps"]].value    = result["total_steps"]
         row[c["complete_steps"]].value = result["completed_steps"]
 
         # executor — backfill if blank
         if result["executor"] and not row[c["executor"]].value:
             row[c["executor"]].value = result["executor"]
+            row_changed = True
 
         if row_changed:
             plan_end = row[c["plan_end_latest"]].value
@@ -855,7 +817,16 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict], *,
         log.info(f"DRY RUN — cycle list NOT saved ({len(changes)} changes computed, "
                  f"{len(missing_scripts)} missing scripts)")
     else:
-        wb.save(cycle_list_path)
+        try:
+            wb.save(cycle_list_path)
+        except PermissionError:
+            wb.close()
+            raise PermissionError(
+                f"Could not save cycle list — close the file in Excel first: {cycle_list_path}"
+            )
+        except Exception as e:
+            wb.close()
+            raise RuntimeError(f"Could not save cycle list: {e}") from e
     wb.close()
     log.info(f"Cycle list updated — {len(changes)} rows changed, "
              f"{len(missing_scripts)} cycles missing scripts")
