@@ -227,8 +227,8 @@ CHANGE LOG
 ================================================================================
 """
 
+import json
 import os
-import io
 import re
 import logging
 from datetime import datetime, date, timedelta
@@ -288,44 +288,10 @@ CONFIG = {
     # Dry-run mode: compute all changes but do NOT write the cycle list or send any
     # notifications. Useful for validating what the automation would do before going live.
     "dry_run": False,
-}
 
-# ─────────────────────────────────────────────────────────────
-# COLUMN INDICES (0-based) — from your actual files
-# ─────────────────────────────────────────────────────────────
-
-# テストサイクル一覧 sheet
-CYCLE_COLS = {
-    # NOTE: col 0 (テストサイクルID) is a formula ="AT1TC_"&H5&TEXT(C5,"000")
-    # We DO NOT read col 0 directly. Instead we reconstruct the ID from:
-    #   area (col 7) + seq_no (col 2) to match against script filenames.
-    "cycle_id":          0,   # テストサイクルID (formula — read via reconstruct_cycle_id)
-    "seq_no":            2,   # 領域内サイクル連番 (e.g. 1, 2, 3)
-    "cycle_name":        1,   # サイクル名称
-    "area":              7,   # 担当領域 (e.g. "SD/FI")
-    "regression_flag":   8,   # リグレッション対象フラグ (X = regression, NOT deletion)
-    "deletion_flag":     9,   # 削除フラグ (X = deleted, skip)
-    "plan_start_latest": 24,  # 実行開始予定日(最新)
-    "plan_end_latest":   25,  # 実行完了予定日(最新)
-    "actual_start":      26,  # 実行開始実績日
-    "actual_end":        27,  # 実行完了実績日
-    "executor":          32,  # 実行担当者
-    "exec_status":       33,  # 実行ステータス
-    "total_steps":       34,  # 総テストステップ数
-    "complete_steps":    35,  # 完了テストステップ数
-}
-
-# テスト仕様書兼結果記述書 sheet
-SCRIPT_COLS = {
-    "excluded":       8,   # テスト対象外 ('X' = skip this step)
-    "exec_pic":       25,  # 初回実行 担当者
-    "planned_date":   26,  # 初回実行 実行予定日
-    "actual_date":    27,  # 初回実行 実行日
-    "result":         28,  # 初回実行 テスト結果 (OK / NG / -)
-    "retest_pic":     30,  # 再実行 担当者
-    "retest_planned": 31,  # 再実行 実行予定日
-    "retest_date":    32,  # 再実行 実行日
-    "retest_result":  33,  # 再実行 テスト結果
+    # Active test-stage profile key (see DEFAULT_PROFILES below).
+    # Change this here for headless/scheduled runs, or use the Streamlit sidebar.
+    "active_profile": "AT-SAP",
 }
 
 # Execution status dropdown values (from the 'list' sheet)
@@ -338,10 +304,83 @@ STATUS = {
     "cancelled":   "99.キャンセル",
 }
 
-# Header rows to skip in condition scripts (0-indexed rows 0-3 are headers, data starts row 4)
-SCRIPT_HEADER_ROWS = 4
-# Header rows to skip in cycle list (rows 0-2 are headers, data starts row 3)
-CYCLE_HEADER_ROWS = 3
+# ─────────────────────────────────────────────────────────────
+# PROFILES — per-test-stage / per-project configuration
+# ─────────────────────────────────────────────────────────────
+# Each profile captures everything that differs between test stages
+# (AT-SAP, BLT, AT-IF, SIT) or between project customisations:
+#   • filename patterns          • Excel sheet names
+#   • header row counts          • all column indices (0-based)
+#   • cycle-ID prefix & format
+#
+# AT-SAP is the fully-verified reference profile.
+# BLT / AT-IF / SIT ship as templates that mirror AT-SAP column
+# indices — verify against each stage's actual Excel files and
+# save adjustments via the Streamlit "Edit Profile" panel.
+# Saved changes are written to profiles.json next to this script
+# and override the built-in defaults on every future run.
+# ─────────────────────────────────────────────────────────────
+
+PROFILES_FILE: Path = Path(__file__).parent / "profiles.json"
+
+DEFAULT_PROFILES: dict[str, dict] = {
+    "AT-SAP": {
+        "display_name":             "AT-SAP (SAP内結合テスト)",
+        "cycle_list_pattern":       r"サイクル一覧",
+        "condition_script_pattern": r"仕様書兼結果記述書.*AT1TC|AT1TC.*仕様書兼結果記述書",
+        "cycle_sheet_name":         "テストサイクル一覧",
+        "script_sheet_name":        "テスト仕様書兼結果記述書",
+        "cycle_header_rows":        3,
+        "script_header_rows":       4,
+        "cycle_id_prefix":          "AT1TC",
+        "cycle_id_area_slash":      True,   # SDFI → SD/FI
+        "configured":               True,   # set False on template profiles
+        "cycle_cols": {
+            "cycle_id":          0,
+            "seq_no":            2,
+            "cycle_name":        1,
+            "area":              7,
+            "regression_flag":   8,
+            "deletion_flag":     9,
+            "plan_start_latest": 24,
+            "plan_end_latest":   25,
+            "actual_start":      26,
+            "actual_end":        27,
+            "executor":          32,
+            "exec_status":       33,
+            "total_steps":       34,
+            "complete_steps":    35,
+        },
+        "script_cols": {
+            "excluded":       8,
+            "exec_pic":       25,
+            "planned_date":   26,
+            "actual_date":    27,
+            "result":         28,
+            "retest_pic":     30,
+            "retest_planned": 31,
+            "retest_date":    32,
+            "retest_result":  33,
+        },
+    },
+}
+
+# Build BLT / AT-IF / SIT as template copies of AT-SAP.
+# Column indices default to AT-SAP values — update via the UI.
+for _stage, _prefix, _display, _pat in [
+    ("BLT",   "BLT",  "BLT (業務連携テスト)",         r"仕様書兼結果記述書.*BLT|BLT.*仕様書兼結果記述書"),
+    ("AT-IF", "ATIF", "AT-IF (インターフェーステスト)", r"仕様書兼結果記述書.*ATIF|ATIF.*仕様書兼結果記述書"),
+    ("SIT",   "SIT",  "SIT (システム統合テスト)",       r"仕様書兼結果記述書.*SIT|SIT.*仕様書兼結果記述書"),
+]:
+    DEFAULT_PROFILES[_stage] = {
+        **DEFAULT_PROFILES["AT-SAP"],
+        "display_name":             f"{_display}  ⚠ verify column indices",
+        "condition_script_pattern": _pat,
+        "cycle_id_prefix":          _prefix,
+        "configured":               False,
+        "cycle_cols":               dict(DEFAULT_PROFILES["AT-SAP"]["cycle_cols"]),
+        "script_cols":              dict(DEFAULT_PROFILES["AT-SAP"]["script_cols"]),
+    }
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING
@@ -364,16 +403,75 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
+# PROFILE MANAGEMENT
+# ─────────────────────────────────────────────────────────────
+def load_profiles() -> dict[str, dict]:
+    """
+    Return the merged profile dict: built-in DEFAULT_PROFILES overridden by
+    any user edits stored in profiles.json.
+
+    Merging rules:
+      • A profile that exists in profiles.json completely replaces the built-in
+        for top-level scalar keys (display_name, patterns, sheet names, …).
+      • cycle_cols / script_cols are merged at the field level so a partial
+        override (e.g. only changing two column indices) leaves the rest intact.
+      • A brand-new profile not present in DEFAULT_PROFILES is seeded from
+        AT-SAP so it always has every required key.
+    """
+    if not PROFILES_FILE.exists():
+        return {k: dict(v) for k, v in DEFAULT_PROFILES.items()}
+
+    try:
+        with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+            user_profiles: dict = json.load(f)
+    except Exception as e:
+        log.warning(f"Could not read {PROFILES_FILE.name}: {e} — using built-in defaults")
+        return {k: dict(v) for k, v in DEFAULT_PROFILES.items()}
+
+    merged: dict[str, dict] = {k: dict(v) for k, v in DEFAULT_PROFILES.items()}
+    for name, user_p in user_profiles.items():
+        base = dict(merged.get(name, DEFAULT_PROFILES["AT-SAP"]))
+        for key, val in user_p.items():
+            if key in ("cycle_cols", "script_cols") and isinstance(val, dict):
+                base[key] = {**base.get(key, {}), **val}
+            else:
+                base[key] = val
+        merged[name] = base
+    return merged
+
+
+def save_profiles(profiles: dict[str, dict]) -> None:
+    """Persist the complete profiles dict to profiles.json."""
+    try:
+        with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+            json.dump(profiles, f, ensure_ascii=False, indent=2)
+        log.info(f"Profiles saved → {PROFILES_FILE}")
+    except Exception as e:
+        log.error(f"Could not save profiles: {e}")
+
+
+def get_active_profile() -> dict:
+    """Return the profile dict for CONFIG['active_profile'], falling back to AT-SAP."""
+    profiles = load_profiles()
+    name = CONFIG.get("active_profile", "AT-SAP")
+    if name not in profiles:
+        log.warning(f"Profile '{name}' not found — falling back to AT-SAP")
+        name = "AT-SAP"
+    return profiles[name]
+
+
+# ─────────────────────────────────────────────────────────────
 # FILE DISCOVERY
 # ─────────────────────────────────────────────────────────────
-def find_files(folder: str) -> tuple[str | None, list[str]]:
+def find_files(folder: str, *, profile: dict | None = None) -> tuple[str | None, list[str]]:
     """
     Scan folder for:
-    - One cycle list file (matches cycle_list_pattern)
-    - All condition script files (match condition_script_pattern)
+    - One cycle list file  (matches profile's cycle_list_pattern)
+    - N condition scripts  (match profile's condition_script_pattern)
 
     Returns (cycle_list_path, [script_paths])
     """
+    p = profile or get_active_profile()
     cycle_list = None
     scripts = []
     root = Path(folder)
@@ -389,10 +487,10 @@ def find_files(folder: str) -> tuple[str | None, list[str]]:
             continue
 
         name = f.name
-        if re.search(CONFIG["cycle_list_pattern"], name):
+        if re.search(p["cycle_list_pattern"], name):
             cycle_list = str(f)
             log.info(f"Cycle list: {name}")
-        elif re.search(CONFIG["condition_script_pattern"], name):
+        elif re.search(p["condition_script_pattern"], name):
             scripts.append(str(f))
             log.info(f"Condition script: {name}")
 
@@ -400,54 +498,60 @@ def find_files(folder: str) -> tuple[str | None, list[str]]:
     return cycle_list, scripts
 
 
-def reconstruct_cycle_id(area: str, seq_no) -> str | None:
+def reconstruct_cycle_id(area: str, seq_no, *, profile: dict | None = None) -> str | None:
     """
-    Reconstruct the cycle ID from area + seq_no columns — same logic as the Excel formula:
-      ="AT1TC_"&H5&TEXT(C5,"000")
-    e.g. area="SD/FI", seq_no=1 → "AT1TC_SD/FI001"
+    Reconstruct the cycle ID from area + seq_no — mirrors the Excel formula
+      ="<prefix>_"&<area_col>&TEXT(<seq_col>,"000")
+    e.g. prefix="AT1TC", area="SD/FI", seq_no=1 → "AT1TC_SD/FI001"
+
+    The prefix and area-slash behaviour come from the active profile.
     """
+    p = profile or get_active_profile()
     if not area or seq_no is None:
         return None
     try:
-        return f"AT1TC_{str(area).strip()}{int(seq_no):03d}"
+        area_str = str(area).strip()
+        if p.get("cycle_id_area_slash", True) and len(area_str) > 2:
+            area_str = area_str[:2] + "/" + area_str[2:]
+        return f"{p['cycle_id_prefix']}_{area_str}{int(seq_no):03d}"
     except (ValueError, TypeError):
         return None
 
 
-def extract_cycle_id_from_filename(filename: str) -> str | None:
+def extract_cycle_id_from_filename(filename: str, *, profile: dict | None = None) -> str | None:
     """
-    Extract cycle ID from the condition script filename.
-    e.g. '⑧_TE586_SAP内結合テスト仕様書兼結果記述書_AT1TC_SDFI001.xlsx'
-         → 'AT1TC_SD/FI001'
+    Extract the cycle ID from a condition script filename using the profile's
+    cycle_id_prefix.
 
-    The filename uses 'SDFI001' but the cycle list uses 'SD/FI001'.
-    We insert '/' before the last letter+digits block if area contains no slash.
+    e.g. profile prefix="AT1TC", filename contains "AT1TC_SDFI001"
+         → "AT1TC_SD/FI001"  (area slash inserted when cycle_id_area_slash=True)
+
+    The regex is built from the profile prefix so BLT, ATIF, SIT etc. all work
+    without code changes.
     """
-    # Match pattern like AT1TC_SDFI001 or AT1TC_SD001 etc.
-    match = re.search(r'(AT\dTC)_([A-Z]+)(\d+)', filename)
+    p = profile or get_active_profile()
+    prefix_pat = re.escape(p["cycle_id_prefix"])
+    match = re.search(rf'({prefix_pat})_([A-Z]+)(\d+)', filename)
     if not match:
         return None
 
-    prefix = match.group(1)   # e.g. AT1TC
-    area   = match.group(2)   # e.g. SDFI or SD
-    num    = match.group(3)   # e.g. 001
+    prefix = match.group(1)
+    area   = match.group(2)
+    num    = match.group(3)
 
-    # Insert slash: SDFI → SD/FI, MM → MM, FI → FI
-    # Rule: split after first 2 uppercase chars if total > 2
-    if len(area) > 2:
-        area_with_slash = area[:2] + "/" + area[2:]
-    else:
-        area_with_slash = area
+    if p.get("cycle_id_area_slash", True) and len(area) > 2:
+        area = area[:2] + "/" + area[2:]
 
-    return f"{prefix}_{area_with_slash}{num}"
+    return f"{prefix}_{area}{num}"
 
 
 # ─────────────────────────────────────────────────────────────
 # CONDITION SCRIPT ANALYSIS
 # ─────────────────────────────────────────────────────────────
-def analyze_script(filepath: str) -> dict | None:
+def analyze_script(filepath: str, *, profile: dict | None = None) -> dict | None:
     """
     Read a condition script and return completion status.
+    Sheet names, column indices, and header-row counts come from the profile.
 
     Returns dict with:
       cycle_id          - extracted from filename
@@ -460,7 +564,8 @@ def analyze_script(filepath: str) -> dict | None:
       executor          - name(s) from 実行担当者 column
       earliest_planned  - earliest planned execution date (for reminders)
     """
-    cycle_id = extract_cycle_id_from_filename(Path(filepath).name)
+    p = profile or get_active_profile()
+    cycle_id = extract_cycle_id_from_filename(Path(filepath).name, profile=p)
     if not cycle_id:
         log.warning(f"Could not extract cycle ID from: {Path(filepath).name}")
         return None
@@ -471,13 +576,14 @@ def analyze_script(filepath: str) -> dict | None:
         log.warning(f"Could not open {Path(filepath).name}: {e}")
         return None
 
-    sheet_name = "テスト仕様書兼結果記述書"
+    sheet_name = p["script_sheet_name"]
     if sheet_name not in wb.sheetnames:
         log.warning(f"Sheet '{sheet_name}' not found in {Path(filepath).name}")
         return None
 
     ws = wb[sheet_name]
-    c = SCRIPT_COLS
+    c = p["script_cols"]
+    hdr = p["script_header_rows"]
 
     total = 0
     completed = 0
@@ -489,7 +595,7 @@ def analyze_script(filepath: str) -> dict | None:
     last_step_no = None  # carries the step number forward across merged-cell rows
 
     for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
-        if row_idx < SCRIPT_HEADER_ROWS:
+        if row_idx < hdr:
             continue
 
         # Stop at sentinel row
@@ -542,7 +648,9 @@ def analyze_script(filepath: str) -> dict | None:
         # Determine result — retest takes priority over first run
         retest_result = row[c["retest_result"]] if len(row) > c["retest_result"] else None
         first_result  = row[c["result"]]         if len(row) > c["result"]         else None
-        result = retest_result if retest_result and retest_result.strip() not in ("", "-") else first_result
+        result = (retest_result
+                  if isinstance(retest_result, str) and retest_result.strip() not in ("", "-")
+                  else first_result)
 
         retest_date = row[c["retest_date"]] if len(row) > c["retest_date"] else None
         first_date  = row[c["actual_date"]] if len(row) > c["actual_date"] else None
@@ -577,7 +685,8 @@ def analyze_script(filepath: str) -> dict | None:
 # ─────────────────────────────────────────────────────────────
 # CYCLE LIST UPDATE
 # ─────────────────────────────────────────────────────────────
-def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> tuple[list[dict], list[dict]]:
+def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict], *,
+                      profile: dict | None = None) -> tuple[list[dict], list[dict]]:
     """
     Open the Test Cycle List, update status/dates/counts from script results,
     save in place (unless dry_run is set in CONFIG).
@@ -590,19 +699,21 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
     We ONLY write to columns that contain plain values (not formulas).
     Formula columns (flags, report tabs) are left untouched.
     """
+    p = profile or get_active_profile()
     wb = openpyxl.load_workbook(cycle_list_path)  # NOT read_only, NOT data_only
-    ws = wb["テストサイクル一覧"]
-    c = CYCLE_COLS
+    ws = wb[p["cycle_sheet_name"]]
+    c = p["cycle_cols"]
+    hdr = p["cycle_header_rows"]
     today = date.today()
     changes: list[dict] = []
     missing_scripts: list[dict] = []
     seen_ids: set[str] = set()
 
-    for row in ws.iter_rows(min_row=CYCLE_HEADER_ROWS + 1):
+    for row in ws.iter_rows(min_row=hdr + 1):
         # Reconstruct cycle ID from area + seq_no (col 0 is a formula openpyxl can't evaluate)
         area_val   = row[c["area"]].value
         seq_val    = row[c["seq_no"]].value
-        cycle_id   = reconstruct_cycle_id(area_val, seq_val)
+        cycle_id   = reconstruct_cycle_id(area_val, seq_val, profile=p)
 
         if not cycle_id:
             continue
@@ -671,13 +782,17 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
             row[c["exec_status"]].value = new_status
             row_changed = True
 
-        # step counts — always sync
+        # step counts — always sync; flag row_changed when the numbers actually differ
+        if (row[c["total_steps"]].value    != result["total_steps"] or
+                row[c["complete_steps"]].value != result["completed_steps"]):
+            row_changed = True
         row[c["total_steps"]].value    = result["total_steps"]
         row[c["complete_steps"]].value = result["completed_steps"]
 
         # executor — backfill if blank
         if result["executor"] and not row[c["executor"]].value:
             row[c["executor"]].value = result["executor"]
+            row_changed = True
 
         if row_changed:
             plan_end = row[c["plan_end_latest"]].value
@@ -702,7 +817,16 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
         log.info(f"DRY RUN — cycle list NOT saved ({len(changes)} changes computed, "
                  f"{len(missing_scripts)} missing scripts)")
     else:
-        wb.save(cycle_list_path)
+        try:
+            wb.save(cycle_list_path)
+        except PermissionError:
+            wb.close()
+            raise PermissionError(
+                f"Could not save cycle list — close the file in Excel first: {cycle_list_path}"
+            )
+        except Exception as e:
+            wb.close()
+            raise RuntimeError(f"Could not save cycle list: {e}") from e
     wb.close()
     log.info(f"Cycle list updated — {len(changes)} rows changed, "
              f"{len(missing_scripts)} cycles missing scripts")
@@ -712,27 +836,29 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict]) -> 
 # ─────────────────────────────────────────────────────────────
 # REMINDER DETECTION
 # ─────────────────────────────────────────────────────────────
-def get_reminders(cycle_list_path: str, today: date) -> list[dict]:
+def get_reminders(cycle_list_path: str, today: date, *, profile: dict | None = None) -> list[dict]:
     """
     Scan cycle list for cycles needing attention:
     - upcoming:  plan start within N days, not yet started
     - overdue:   plan end has passed, not complete
     - stalled:   in progress, plan end within last 5 days, no actual end
     """
+    p = profile or get_active_profile()
     wb = openpyxl.load_workbook(cycle_list_path, read_only=True, data_only=True)
-    ws = wb["テストサイクル一覧"]
-    c = CYCLE_COLS
+    ws = wb[p["cycle_sheet_name"]]
+    c = p["cycle_cols"]
+    hdr = p["cycle_header_rows"]
     days_ahead = CONFIG["reminder_days_ahead"]
     reminders = []
 
-    for row in ws.iter_rows(min_row=CYCLE_HEADER_ROWS + 1, values_only=True):
+    for row in ws.iter_rows(min_row=hdr + 1, values_only=True):
         if not row:
             continue
 
         # Reconstruct cycle ID from area + seq_no
         area_val = row[c["area"]]
         seq_val  = row[c["seq_no"]]
-        cycle_id = reconstruct_cycle_id(area_val, seq_val)
+        cycle_id = reconstruct_cycle_id(area_val, seq_val, profile=p)
         if not cycle_id:
             continue
 
@@ -1010,6 +1136,14 @@ def run():
     log.info(f"SAP Test Automation — {today}")
     log.info(f"{'='*60}")
 
+    # Resolve the active profile once; pass it to every function so they all
+    # use the same consistent configuration for this run.
+    profile = get_active_profile()
+    log.info(f"Active profile: {profile.get('display_name', CONFIG.get('active_profile'))}")
+    if not profile.get("configured", True):
+        log.warning("Profile is not fully configured — column indices may be incorrect. "
+                    "Verify via the Streamlit profile editor before running live.")
+
     folder = CONFIG["folder"]
     if not os.path.exists(folder):
         log.error(f"Folder not found: {folder}")
@@ -1017,21 +1151,21 @@ def run():
         return
 
     # 1. Find files
-    cycle_list_path, script_paths = find_files(folder)
+    cycle_list_path, script_paths = find_files(folder, profile=profile)
 
     if not cycle_list_path:
-        log.error("Could not find the Test Cycle List file. Check 'cycle_list_pattern' in CONFIG.")
+        log.error("Could not find the Test Cycle List file. Check 'cycle_list_pattern' in the profile.")
         return
 
     if not script_paths:
-        log.error("No condition script files found. Check 'condition_script_pattern' in CONFIG.")
+        log.error("No condition script files found. Check 'condition_script_pattern' in the profile.")
         return
 
     # 2. Analyze all condition scripts
     log.info(f"Analyzing {len(script_paths)} condition scripts...")
     script_results = {}
     for path in script_paths:
-        result = analyze_script(path)
+        result = analyze_script(path, profile=profile)
         if result:
             script_results[result["cycle_id"]] = result
             status_str = "✅ DONE" if result["all_ok"] else f"{result['completed_steps']}/{result['total_steps']} steps"
@@ -1041,7 +1175,7 @@ def run():
 
     # 3. Update cycle list
     log.info("Updating Test Cycle List...")
-    changes, missing_scripts = update_cycle_list(cycle_list_path, script_results)
+    changes, missing_scripts = update_cycle_list(cycle_list_path, script_results, profile=profile)
     if missing_scripts:
         log.warning(f"{len(missing_scripts)} active cycle(s) have no matching script:")
         for m in missing_scripts:
@@ -1049,7 +1183,7 @@ def run():
     # OneDrive will auto-sync the updated file to SharePoint
 
     # 4. Get reminders
-    reminders = get_reminders(cycle_list_path, today)
+    reminders = get_reminders(cycle_list_path, today, profile=profile)
     log.info(f"Reminders: {len(reminders)} cycles need attention")
 
     # 5. Send individual executor reminders
