@@ -2,10 +2,11 @@
 AT Sentinel — Streamlit UI
 ===========================
 Run with:  streamlit run app.py
-Requires:  pip install streamlit openpyxl pywin32
+Requires:  pip install -r requirements.txt
 """
 
 import json
+import pandas as pd
 import streamlit as st
 from datetime import date, datetime
 from pathlib import Path
@@ -18,6 +19,9 @@ from AT_Sentinel import (
     get_reminders, notify, build_manager_report,
     build_executor_reminder, resolve_email,
     load_profiles, save_profiles,
+    read_cycle_data, build_daywise_report,
+    build_streamwise_report, build_executorwise_report,
+    build_cycle_step_report,
     STATUS, CONFIG, DEFAULT_PROFILES,
 )
 
@@ -58,7 +62,6 @@ with st.sidebar:
         index=default_idx,
         help="Select the test stage. Column indices and patterns are loaded from this profile.",
     )
-    # Propagate selection immediately so all get_active_profile() calls use it.
     sentinel.CONFIG["active_profile"] = active_profile_name
     active_profile = profiles[active_profile_name]
 
@@ -71,7 +74,6 @@ with st.sidebar:
 
     # ── 1a. Profile editor ─────────────────────────────────────────────────────
     with st.expander("✏️ Edit / Add Profiles"):
-        # ── Add / delete controls (outside the form to avoid nesting)
         col_new, col_del = st.columns(2)
         new_name = col_new.text_input("New profile name", key="new_profile_name",
                                       placeholder="e.g. SIT-Phase2")
@@ -98,7 +100,6 @@ with st.sidebar:
 
         st.divider()
 
-        # ── Edit form
         with st.form(f"profile_form_{active_profile_name}"):
             p = active_profile
 
@@ -126,7 +127,7 @@ with st.sidebar:
             new_slash     = c4.checkbox("Area slash (SDFI→SD/FI)",
                                         value=p.get("cycle_id_area_slash", True))
 
-            # Cycle list columns — editable table
+            # Cycle list columns
             st.markdown("**Cycle list columns** (0-indexed)")
             _CC_LABELS = {
                 "cycle_id":          "Cycle ID (formula col)",
@@ -139,6 +140,8 @@ with st.sidebar:
                 "plan_end_latest":   "Plan End (latest)",
                 "actual_start":      "Actual Start",
                 "actual_end":        "Actual End",
+                "review_end":        "Review Completion Date",
+                "review_plan_end":   "Review Plan End (latest)",
                 "executor":          "Executor",
                 "exec_status":       "Exec Status",
                 "total_steps":       "Total Steps",
@@ -160,7 +163,7 @@ with st.sidebar:
                 key=f"cc_editor_{active_profile_name}",
             )
 
-            # Script columns — editable table
+            # Script columns
             st.markdown("**Script columns** (0-indexed)")
             _SC_LABELS = {
                 "excluded":       "Excluded flag",
@@ -172,6 +175,9 @@ with st.sidebar:
                 "retest_planned": "Retest planned date",
                 "retest_date":    "Retest actual date",
                 "retest_result":  "Retest result",
+                "review_pic":     "Review executor",
+                "review_date":    "Review actual date",
+                "review_result":  "Review result (OK/NG/-)",
             }
             sc_rows = [
                 {"Column": lbl, "_key": k, "Index": p["script_cols"].get(k, 0)}
@@ -243,7 +249,23 @@ with st.sidebar:
 
     st.divider()
 
-    # ── 5. Executor emails ─────────────────────────────────────────────────────
+    # ── 5. Notification time slot ──────────────────────────────────────────────
+    st.subheader("Notification Time Slot")
+    time_slot = st.radio(
+        "When are you running?",
+        options=["morning", "midday", "evening"],
+        format_func=lambda x: {
+            "morning": "Morning  9:00 — overdue + starting today",
+            "midday":  "Midday  12:00 — overdue + starting today",
+            "evening": "Evening 17:00 — above + starting/due tomorrow",
+        }[x],
+        index=0,
+        horizontal=False,
+    )
+
+    st.divider()
+
+    # ── 6. Executor emails ─────────────────────────────────────────────────────
     st.subheader("Executor Emails")
     st.caption("Executor name → email mappings used for reminder dispatch.")
 
@@ -280,7 +302,6 @@ sentinel.CONFIG.update({
     "notify_channels":     [ch for ch, on in [("email", email_on), ("teams", teams_on)] if on],
     "teams_channel_email": teams_ch_email,
     "executor_emails":     new_exec_emails,
-    # active_profile already set above when selectbox was rendered
 })
 
 # ── Main area ──────────────────────────────────────────────────────────────────
@@ -302,190 +323,301 @@ if not active_profile.get("configured", True):
         icon="⚠️",
     )
 
-run_clicked = st.button("▶ Run Now", type="primary", use_container_width=True)
+# Resolve profile once — shared by both tabs
+run_profile = load_profiles().get(
+    active_profile_name,
+    DEFAULT_PROFILES.get(active_profile_name, DEFAULT_PROFILES["AT-SAP"]),
+)
 
-if run_clicked:
-    sentinel.setup_logging()
-    today = date.today()
+tab_run, tab_reports = st.tabs(["▶ Run", "📊 Reports"])
 
-    # Pre-initialise so all vars remain in scope after the status block
-    changes         = []
-    missing_scripts = []
-    reminders       = []
-    overdue         = []
-    stalled         = []
-    upcoming        = []
+# ── RUN TAB ───────────────────────────────────────────────────────────────────
+with tab_run:
+    run_clicked = st.button("▶ Run Now", type="primary", use_container_width=True)
 
-    # Resolve profile once for this run
-    run_profile = load_profiles().get(active_profile_name,
-                                      DEFAULT_PROFILES.get(active_profile_name,
-                                                           DEFAULT_PROFILES["AT-SAP"]))
+    if run_clicked:
+        sentinel.setup_logging()
+        today = date.today()
 
-    with st.status("Running AT Sentinel…", expanded=True) as status_widget:
+        changes         = []
+        missing_scripts = []
+        reminders       = []
 
-        # 1 ── Discover files
-        st.write(f"📁 Scanning folder for test files (profile: **{active_profile_name}**)…")
-        cycle_list_path, script_paths = find_files(folder, profile=run_profile)
+        with st.status("Running AT Sentinel…", expanded=True) as status_widget:
 
-        if not cycle_list_path:
-            status_widget.update(label="Failed — cycle list not found", state="error")
-            st.error("Cycle list file not found. Check **folder path** and the profile's "
-                     "**cycle_list_pattern**.")
-            st.stop()
+            # 1 — Discover files
+            st.write(f"📁 Scanning folder (profile: **{active_profile_name}**)…")
+            cycle_list_path, script_paths = find_files(folder, profile=run_profile)
 
-        if not script_paths:
-            status_widget.update(label="Failed — no condition scripts found", state="error")
-            st.error("No condition script files found. Check the profile's "
-                     "**condition_script_pattern**.")
-            st.stop()
+            if not cycle_list_path:
+                status_widget.update(label="Failed — cycle list not found", state="error")
+                st.error("Cycle list file not found. Check **folder path** and the profile's **cycle_list_pattern**.")
+                st.stop()
 
-        st.write(f"✅ Found **{len(script_paths)}** condition script(s)")
+            if not script_paths:
+                status_widget.update(label="Failed — no condition scripts found", state="error")
+                st.error("No condition script files found. Check the profile's **condition_script_pattern**.")
+                st.stop()
 
-        # 2 ── Analyze scripts
-        st.write("🔍 Analyzing condition scripts…")
-        script_results = {}
-        for path in script_paths:
-            result = analyze_script(path, profile=run_profile)
-            if result:
-                script_results[result["cycle_id"]] = result
-        st.write(f"✅ Successfully analyzed **{len(script_results)}** script(s)")
+            # Store for Reports tab
+            st.session_state["last_cycle_list_path"] = cycle_list_path
+            st.write(f"✅ Found **{len(script_paths)}** condition script(s)")
 
-        # 3 ── Update cycle list
-        st.write("📝 Updating Test Cycle List…")
-        changes, missing_scripts = update_cycle_list(cycle_list_path, script_results,
-                                                     profile=run_profile)
-        save_note = " (dry run — not saved)" if dry_run else " — OneDrive will sync automatically"
-        st.write(f"✅ Updated **{len(changes)}** row(s){save_note}")
+            # 2 — Analyze scripts
+            st.write("🔍 Analyzing condition scripts…")
+            script_results = {}
+            for path in script_paths:
+                result = analyze_script(path, profile=run_profile)
+                if result:
+                    script_results[result["cycle_id"]] = result
+            st.write(f"✅ Successfully analyzed **{len(script_results)}** script(s)")
+
+            # 3 — Update cycle list
+            st.write("📝 Updating Test Cycle List…")
+            changes, missing_scripts = update_cycle_list(
+                cycle_list_path, script_results, profile=run_profile
+            )
+            save_note = " (dry run — not saved)" if dry_run else " — OneDrive will sync automatically"
+            st.write(f"✅ Updated **{len(changes)}** row(s){save_note}")
+            if missing_scripts:
+                st.write(f"⚠️ **{len(missing_scripts)}** active cycle(s) have no matching script file")
+
+            # 4 — Reminders
+            st.write(f"🔔 Detecting reminders (slot: **{time_slot}**)…")
+            reminders = get_reminders(cycle_list_path, today, profile=run_profile, time_slot=time_slot)
+            overdue        = [r for r in reminders if r["type"] == "overdue"]
+            starting_today = [r for r in reminders if r["type"] == "starting_today"]
+            st_tomorrow    = [r for r in reminders if r["type"] == "starting_tomorrow"]
+            due_tomorrow   = [r for r in reminders if r["type"] == "due_tomorrow"]
+            st.write(
+                f"✅ {len(overdue)} overdue · {len(starting_today)} starting today"
+                + (f" · {len(st_tomorrow)} starting tomorrow · {len(due_tomorrow)} due tomorrow"
+                   if time_slot == "evening" else "")
+            )
+
+            # 5 — Notifications
+            active_channels = sentinel.CONFIG["notify_channels"]
+            if not active_channels:
+                st.write("⚠️ No notification channels selected — skipping")
+            elif dry_run:
+                st.write("🔵 Dry run — notifications skipped")
+            else:
+                st.write(f"📨 Sending via: **{', '.join(active_channels)}**…")
+                sent_keys: set[str] = set()
+                for reminder in reminders:
+                    executor_name = reminder.get("executor")
+                    if not executor_name:
+                        continue
+                    for name in [n.strip() for n in str(executor_name).split(",")]:
+                        email_addr = resolve_email(name)
+                        if not email_addr:
+                            continue
+                        key = f"{email_addr}_{reminder['cycle_id']}_{reminder['type']}"
+                        if key in sent_keys:
+                            continue
+                        sent_keys.add(key)
+                        subject = (
+                            f"[SAP Test{'  TEST MODE' if test_mode else ''}] "
+                            f"{reminder['type'].upper()} — {reminder['cycle_id']} (executor: {name})"
+                        )
+                        notify(email_addr, subject, build_executor_reminder(reminder),
+                               post_to_teams=False)
+
+                report_html   = build_manager_report(changes, reminders, today, missing_scripts)
+                completed_cnt = len([c for c in changes if c["new_status"] == STATUS["complete"]])
+                notify(
+                    manager_email,
+                    f"[SAP Test/{active_profile_name}] Daily Report {today.strftime('%Y/%m/%d')} — "
+                    f"{completed_cnt} completed, {len(overdue)} overdue",
+                    report_html,
+                    post_to_teams=True,
+                )
+                st.write("✅ Notifications dispatched")
+
+            run_label = (
+                f"🔵 Dry Run complete — {today.strftime('%Y/%m/%d %H:%M')} — no changes written"
+                if dry_run else
+                f"✅ Run complete — {today.strftime('%Y/%m/%d %H:%M')}"
+            )
+            status_widget.update(label=run_label, state="complete")
+
+        # ── Summary metrics ────────────────────────────────────────────────────
+        completed_rows = [c for c in changes if c["new_status"] == STATUS["complete"]]
+        in_review_rows = [c for c in changes if c["new_status"] == STATUS["reviewing"]]
+        started_rows   = [c for c in changes if c["new_status"] == STATUS["in_progress"]
+                                             and c["old_status"] == STATUS["not_started"]]
+
+        _append_run_log({
+            "timestamp":       datetime.now().isoformat(timespec="seconds"),
+            "profile":         active_profile_name,
+            "time_slot":       time_slot,
+            "completed":       len(completed_rows),
+            "in_review":       len(in_review_rows),
+            "started":         len(started_rows),
+            "overdue":         len(overdue),
+            "missing_scripts": len(missing_scripts),
+            "dry_run":         dry_run,
+        })
+
+        if dry_run:
+            st.warning("🔵 **Dry Run — no changes written to Excel, no notifications sent.**")
+
+        st.subheader("Summary")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("✅ Completed",      len(completed_rows))
+        m2.metric("🔍 In Review",      len(in_review_rows))
+        m3.metric("🚀 Started",        len(started_rows))
+        m4.metric("🔴 Overdue",        len(overdue))
+        m5.metric("🟢 Starting Today", len(starting_today))
+        m6.metric("⚠️ No Script",     len(missing_scripts))
+
+        # ── Detail tables ──────────────────────────────────────────────────────
+        def _show_table(rows: list, col_map: dict, label: str) -> None:
+            if not rows:
+                return
+            with st.expander(label):
+                st.dataframe(
+                    [{display: r.get(key, "-") for display, key in col_map.items()} for r in rows],
+                    use_container_width=True,
+                )
+
+        _show_table(completed_rows, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name", "Area": "area", "Executor": "executor",
+        }, f"✅ Completed ({len(completed_rows)})")
+
+        _show_table(in_review_rows, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name", "Area": "area", "Executor": "executor",
+        }, f"🔍 Moved to In Review ({len(in_review_rows)})")
+
+        _show_table(overdue, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name",
+            "Plan End": "plan_end", "Executor": "executor", "Status": "status",
+        }, f"🔴 Overdue ({len(overdue)})")
+
+        _show_table(due_tomorrow, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name",
+            "Plan End": "plan_end", "Executor": "executor", "Status": "status",
+        }, f"⚡ Due Tomorrow ({len(due_tomorrow)})")
+
+        _show_table(starting_today, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name",
+            "Plan Start": "plan_start", "Executor": "executor",
+        }, f"🟢 Starting Today ({len(starting_today)})")
+
+        _show_table(st_tomorrow, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name",
+            "Plan Start": "plan_start", "Executor": "executor",
+        }, f"📅 Starting Tomorrow ({len(st_tomorrow)})")
+
+        _show_table(started_rows, {
+            "Cycle ID": "cycle_id", "Name": "cycle_name", "Area": "area", "Executor": "executor",
+        }, f"🚀 Newly Started ({len(started_rows)})")
+
         if missing_scripts:
-            st.write(f"⚠️ **{len(missing_scripts)}** active cycle(s) have no matching script file")
+            _show_table(missing_scripts, {
+                "Cycle ID": "cycle_id", "Name": "cycle_name", "Area": "area",
+                "Current Status": "exec_status", "Executor": "executor",
+            }, f"⚠️ No Script Found ({len(missing_scripts)})")
 
-        # 4 ── Reminders
-        st.write("🔔 Detecting reminders…")
-        reminders = get_reminders(cycle_list_path, today, profile=run_profile)
-        overdue   = [r for r in reminders if r["type"] == "overdue"]
-        stalled   = [r for r in reminders if r["type"] == "stalled"]
-        upcoming  = [r for r in reminders if r["type"] == "upcoming"]
-        st.write(f"✅ {len(overdue)} overdue · {len(stalled)} stalled · {len(upcoming)} upcoming")
+# ── REPORTS TAB ───────────────────────────────────────────────────────────────
+with tab_reports:
+    st.subheader("📊 Reports")
 
-        # 5 ── Notifications
-        active_channels = sentinel.CONFIG["notify_channels"]
-        if not active_channels:
-            st.write("⚠️ No notification channels selected — skipping")
-        elif dry_run:
-            st.write("🔵 Dry run — notifications skipped")
-        else:
-            st.write(f"📨 Sending via: **{', '.join(active_channels)}**…")
-            sent_keys: set[str] = set()
-            for reminder in reminders:
-                executor_name = reminder.get("executor")
-                if not executor_name:
-                    continue
-                for name in [n.strip() for n in str(executor_name).split(",")]:
-                    email_addr = resolve_email(name)
-                    if not email_addr:
-                        continue
-                    key = f"{email_addr}_{reminder['cycle_id']}_{reminder['type']}"
-                    if key in sent_keys:
-                        continue
-                    sent_keys.add(key)
-                    subject = (
-                        f"[SAP Test{'  TEST MODE' if test_mode else ''}] "
-                        f"{reminder['type'].upper()} — {reminder['cycle_id']} (executor: {name})"
-                    )
-                    notify(email_addr, subject, build_executor_reminder(reminder),
-                           post_to_teams=False)
+    report_cycle_path = st.session_state.get("last_cycle_list_path")
 
-            report_html   = build_manager_report(changes, reminders, today, missing_scripts)
-            completed_cnt = len([c for c in changes if c["new_status"] == STATUS["complete"]])
-            notify(
-                manager_email,
-                f"[SAP Test/{active_profile_name}] Daily Report {today.strftime('%Y/%m/%d')} — "
-                f"{completed_cnt} completed, {len(overdue)} overdue",
-                report_html,
-                post_to_teams=True,
-            )
-            st.write("✅ Notifications dispatched")
+    if not report_cycle_path:
+        st.info("Run a sync first, or click **Load Data** to scan the configured folder.")
+        if st.button("📁 Load Data", key="load_reports"):
+            with st.spinner("Scanning folder for cycle list…"):
+                cl, _ = find_files(folder, profile=run_profile)
+                if cl:
+                    st.session_state["last_cycle_list_path"] = cl
+                    st.rerun()
+                else:
+                    st.error("Cycle list not found. Check folder path and profile settings.")
 
-        run_label = (
-            f"🔵 Dry Run complete — {today.strftime('%Y/%m/%d %H:%M')} — no changes written"
-            if dry_run else
-            f"✅ Run complete — {today.strftime('%Y/%m/%d %H:%M')}"
-        )
-        status_widget.update(label=run_label, state="complete")
-
-    # ── Compute summary row lists ──────────────────────────────────────────────
-    completed_rows = [c for c in changes if c["new_status"] == STATUS["complete"]]
-    started_rows   = [c for c in changes if c["new_status"] == STATUS["in_progress"]
-                                         and c["old_status"] == STATUS["not_started"]]
-
-    # ── Persist run to history log ─────────────────────────────────────────────
-    _append_run_log({
-        "timestamp":       datetime.now().isoformat(timespec="seconds"),
-        "profile":         active_profile_name,
-        "completed":       len(completed_rows),
-        "started":         len(started_rows),
-        "overdue":         len(overdue),
-        "stalled":         len(stalled),
-        "upcoming":        len(upcoming),
-        "missing_scripts": len(missing_scripts),
-        "dry_run":         dry_run,
-    })
-
-    # ── Dry Run banner ─────────────────────────────────────────────────────────
-    if dry_run:
-        st.warning("🔵 **Dry Run — no changes written to Excel, no notifications sent.**")
-
-    # ── Summary metrics ────────────────────────────────────────────────────────
-    st.subheader("Summary")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("✅ Completed", len(completed_rows))
-    m2.metric("🚀 Started",   len(started_rows))
-    m3.metric("🔴 Overdue",   len(overdue))
-    m4.metric("⏰ Stalled",   len(stalled))
-    m5.metric("📅 Upcoming",  len(upcoming))
-
-    # ── Detail tables ──────────────────────────────────────────────────────────
-    def _show_table(rows: list, col_map: dict, label: str) -> None:
-        if not rows:
-            return
-        with st.expander(label):
-            st.dataframe(
-                [{display: r.get(key, "-") for display, key in col_map.items()} for r in rows],
-                use_container_width=True,
+    if report_cycle_path:
+        st.caption(f"Data source: `{report_cycle_path}`")
+        try:
+            r1, r2, r3, r4 = st.tabs(
+                ["📋 Cycle & Step", "📅 Daywise", "🏢 Streamwise", "👤 Executorwise"]
             )
 
-    _show_table(completed_rows, {
-        "Cycle ID": "cycle_id", "Name": "cycle_name", "Area": "area",
-        "Executor": "executor",
-    }, f"✅ Completed ({len(completed_rows)})")
+            with r1:
+                st.markdown("**Per-cycle execution and review progress**")
+                cycle_rows = build_cycle_step_report(report_cycle_path, profile=run_profile)
+                if cycle_rows:
+                    st.dataframe(cycle_rows, use_container_width=True)
+                    st.caption(f"Total active cycles: {len(cycle_rows)}")
+                else:
+                    st.info("No cycle data found.")
 
-    _show_table(overdue, {
-        "Cycle ID": "cycle_id", "Name": "cycle_name",
-        "Plan End": "plan_end", "Executor": "executor", "Status": "status",
-    }, f"🔴 Overdue ({len(overdue)})")
+            with r2:
+                st.markdown("**Cumulative execution progress by date**")
+                daywise = build_daywise_report(report_cycle_path, profile=run_profile)
+                if daywise["dates"]:
+                    df_day = pd.DataFrame(daywise["series"], index=daywise["dates"])
+                    st.line_chart(df_day, use_container_width=True)
+                    st.caption(f"Total cycles tracked: {daywise['total']}")
+                    with st.expander("Show data table"):
+                        st.dataframe(df_day, use_container_width=True)
+                else:
+                    st.info("No date data available. Ensure plan/actual dates are populated in the cycle list.")
 
-    _show_table(stalled, {
-        "Cycle ID": "cycle_id", "Name": "cycle_name",
-        "Plan End": "plan_end", "Executor": "executor",
-    }, f"⏰ Stalled ({len(stalled)})")
+            with r3:
+                st.markdown("**Execution and review completion by workstream**")
+                stream_rows = build_streamwise_report(report_cycle_path, profile=run_profile)
+                if stream_rows:
+                    display = [
+                        {"Workstream": r["area"], "Total": r["total"],
+                         "Exec Plan": r["exec_plan"], "Exec Actual": r["exec_actual"],
+                         "Exec Ahead": r["exec_ahead"], "Exec Delay": r["exec_delay"],
+                         "Review Actual": r["review_actual"], "Review Ahead": r["review_ahead"],
+                         "Review Delay": r["review_delay"]}
+                        for r in stream_rows
+                    ]
+                    st.dataframe(display, use_container_width=True)
+                    chart_rows = [r for r in stream_rows if r.get("area") != "Total"]
+                    if chart_rows:
+                        df_s = pd.DataFrame([
+                            {"Workstream": r["area"],
+                             "Exec Actual": r["exec_actual"],
+                             "Review Actual": r["review_actual"]}
+                            for r in chart_rows
+                        ]).set_index("Workstream")
+                        st.bar_chart(df_s, use_container_width=True)
+                else:
+                    st.info("No workstream data found.")
 
-    _show_table(upcoming, {
-        "Cycle ID": "cycle_id", "Name": "cycle_name",
-        "Plan Start": "plan_start", "Executor": "executor",
-    }, f"📅 Upcoming ({len(upcoming)})")
+            with r4:
+                st.markdown("**Execution and review completion by executor**")
+                exec_rows = build_executorwise_report(report_cycle_path, profile=run_profile)
+                if exec_rows:
+                    display = [
+                        {"Executor": r["executor"], "Total": r["total"],
+                         "Exec Plan": r["exec_plan"], "Exec Actual": r["exec_actual"],
+                         "Exec Ahead": r["exec_ahead"], "Exec Delay": r["exec_delay"],
+                         "Review Actual": r["review_actual"], "Review Ahead": r["review_ahead"],
+                         "Review Delay": r["review_delay"]}
+                        for r in exec_rows
+                    ]
+                    st.dataframe(display, use_container_width=True)
+                    chart_rows = [r for r in exec_rows if r.get("executor") != "Total"]
+                    if chart_rows:
+                        df_e = pd.DataFrame([
+                            {"Executor": r["executor"],
+                             "Exec Actual": r["exec_actual"],
+                             "Review Actual": r["review_actual"]}
+                            for r in chart_rows
+                        ]).set_index("Executor")
+                        st.bar_chart(df_e, use_container_width=True)
+                else:
+                    st.info("No executor data found.")
 
-    _show_table(started_rows, {
-        "Cycle ID": "cycle_id", "Name": "cycle_name",
-        "Area": "area", "Executor": "executor",
-    }, f"🚀 Newly Started ({len(started_rows)})")
+        except Exception as e:
+            st.error(f"Could not generate reports: {e}")
 
-    if missing_scripts:
-        _show_table(missing_scripts, {
-            "Cycle ID": "cycle_id", "Name": "cycle_name", "Area": "area",
-            "Current Status": "exec_status", "Executor": "executor",
-        }, f"⚠️ No Script Found ({len(missing_scripts)})")
-
-# ── Run History (always visible at page bottom) ────────────────────────────────
+# ── Run History ────────────────────────────────────────────────────────────────
 st.divider()
 with st.expander("📋 Run History"):
     if RUNS_LOG.exists():

@@ -134,6 +134,8 @@ COLUMN MAPPING — テストサイクル一覧  (0-indexed)
   Index 25  (col Z) : 実行完了予定日(最新)   — plan_end_latest; not auto-populated
   Index 26  (col AA): 実行開始実績日         — actual_start; set from first OK date
   Index 27  (col AB): 実行完了実績日         — actual_end; set from last OK date (all_ok)
+  Index 28  (col AC): レビュー完了実績日     — review_end; set when all review dates filled [NEW]
+  Index 29  (col AD): レビュー完了予定日     — review_plan_end; planned review end (optional) [NEW]
   Index 32  (col AG): 実行担当者             — executor; backfilled from script
   Index 33  (col AH): 実行ステータス         — exec_status; always synced by automation
   Index 34  (col AI): 総テストステップ数     — total_steps; always synced
@@ -153,6 +155,9 @@ COLUMN MAPPING — テスト仕様書兼結果記述書  (0-indexed)
   Index 31  (col AF): 再実行 実行予定日
   Index 32  (col AG): 再実行 実行日          — takes priority over first-run actual_date
   Index 33  (col AH): 再実行 テスト結果      — takes priority over first-run result
+  Index 35  (col AJ): レビュー担当者         — reviewer name (placeholder; verify per stage) [NEW]
+  Index 36  (col AK): レビュー実施日         — actual review date [NEW]
+  Index 37  (col AL): レビュー結果           — review result (OK/NG/-) [NEW]
 
   Header rows: 4 (data starts at Excel row 5 / row_idx >= 4 in iter_rows)
   Sentinel:   Processing stops when col 0 = 'e'
@@ -160,10 +165,11 @@ COLUMN MAPPING — テスト仕様書兼結果記述書  (0-indexed)
 --------------------------------------------------------------------------------
 EXECUTION STATUS VALUES  (dropdown from the 'list' sheet)
 --------------------------------------------------------------------------------
-  00.未開始    — Not started   (no steps complete, no NG)
-  10.実行中    — In progress   (≥1 step complete, OR any NG present)
-  20.レビュー中 — Reviewing    (not set by automation — manual use only)
-  30.完了      — Complete      (all active steps = OK, zero NG)
+  00.未開始    — Not started   (no actual dates entered on any step)
+  10.実行中    — In progress   (≥1 step has an actual date, OR any NG)
+  20.レビュー中 — In Review    (all execution dates filled + all results OK; set by automation)
+  SIR         — SIR           (≥1 step result = NG; regression found)
+  30.完了      — Complete      (all steps have a review completion date)
   99.キャンセル — Cancelled    (excluded from all automation processing)
 
 --------------------------------------------------------------------------------
@@ -350,6 +356,8 @@ DEFAULT_PROFILES: dict[str, dict] = {
             "exec_status":       33,
             "total_steps":       34,
             "complete_steps":    35,
+            "review_end":        28,   # col AC: レビュー完了実績日 — review completion date
+            "review_plan_end":   29,   # col AD: レビュー完了予定日 — planned review end (optional)
         },
         "script_cols": {
             "excluded":       8,
@@ -361,6 +369,9 @@ DEFAULT_PROFILES: dict[str, dict] = {
             "retest_planned": 31,
             "retest_date":    32,
             "retest_result":  33,
+            "review_pic":     35,   # col AJ: レビュー担当者 — reviewer name (placeholder; verify per stage)
+            "review_date":    36,   # col AK: レビュー実施日 — actual review date
+            "review_result":  37,   # col AL: レビュー結果   — review result (OK/NG/-)
         },
     },
 }
@@ -593,6 +604,9 @@ def analyze_script(filepath: str, *, profile: dict | None = None) -> dict | None
     planned_dates = []
     executors = set()
     last_step_no = None  # carries the step number forward across merged-cell rows
+    any_actual_start = False  # any step with actual_date filled (triggers In Progress)
+    review_dates: list = []
+    steps_no_review = 0        # active steps missing a review date (for all_review_complete)
 
     for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
         if row_idx < hdr:
@@ -656,6 +670,10 @@ def analyze_script(filepath: str, *, profile: dict | None = None) -> dict | None
         first_date  = row[c["actual_date"]] if len(row) > c["actual_date"] else None
         actual = retest_date if retest_date else first_date
 
+        # Flag if any step has been started (actual date filled, regardless of result)
+        if actual and isinstance(actual, (datetime, date)):
+            any_actual_start = True
+
         if result == "OK":
             completed += 1
             if actual and isinstance(actual, (datetime, date)):
@@ -666,19 +684,33 @@ def analyze_script(filepath: str, *, profile: dict | None = None) -> dict | None
         elif result == "NG":
             has_ng = True
 
+        # Review date — collect for all_review_complete and last_review_date
+        rev_date_col = c.get("review_date")
+        raw_rev = row[rev_date_col] if (rev_date_col is not None and len(row) > rev_date_col) else None
+        if isinstance(raw_rev, datetime):
+            review_dates.append(raw_rev.date())
+        elif isinstance(raw_rev, date):
+            review_dates.append(raw_rev)
+        else:
+            steps_no_review += 1
+
     wb.close()
 
     return {
-        "cycle_id":          cycle_id,
-        "total_steps":       total,
-        "completed_steps":   completed,
-        "all_ok":            total > 0 and completed == total and not has_ng,
-        "has_ng":            has_ng,
-        "first_actual_date": min(actual_dates)  if actual_dates  else None,
-        "last_actual_date":  max(actual_dates)  if actual_dates  else None,
-        "all_dates_filled":  completed > 0 and ok_steps_missing_date == 0,
-        "executor":          ", ".join(sorted(executors)) if executors else None,
-        "earliest_planned":  min(planned_dates) if planned_dates else None,
+        "cycle_id":            cycle_id,
+        "total_steps":         total,
+        "completed_steps":     completed,
+        "all_ok":              total > 0 and completed == total and not has_ng,
+        "has_ng":              has_ng,
+        "first_actual_date":   min(actual_dates)   if actual_dates   else None,
+        "last_actual_date":    max(actual_dates)   if actual_dates   else None,
+        "all_dates_filled":    completed > 0 and ok_steps_missing_date == 0,
+        "executor":            ", ".join(sorted(executors)) if executors else None,
+        "earliest_planned":    min(planned_dates)  if planned_dates  else None,
+        # New fields
+        "has_any_actual_start": any_actual_start,
+        "all_review_complete":  total > 0 and steps_no_review == 0,
+        "last_review_date":     max(review_dates)  if review_dates   else None,
     }
 
 
@@ -751,11 +783,18 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict], *,
             continue
 
         # Determine new status
-        if result["all_ok"]:
+        # Priority: complete > in_review > sir > in_progress > not_started
+        # Backwards-compatible: fall back to completed_steps > 0 if result dict is old-style
+        has_any_actual = result.get("has_any_actual_start", result["completed_steps"] > 0)
+        all_review_done = result.get("all_review_complete", False)
+
+        if all_review_done:
             new_status = STATUS["complete"]
+        elif result["all_ok"] and result["all_dates_filled"]:
+            new_status = STATUS["reviewing"]   # 20.レビュー中 — all execution done, pending review
         elif result["has_ng"]:
             new_status = STATUS["sir"]
-        elif result["completed_steps"] > 0:
+        elif has_any_actual:
             new_status = STATUS["in_progress"]
         else:
             new_status = STATUS["not_started"]
@@ -775,6 +814,14 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict], *,
         # actual end date — only set when all OK, all actual dates present, and currently blank
         if result["all_ok"] and result["all_dates_filled"] and result["last_actual_date"] and not row[c["actual_end"]].value:
             row[c["actual_end"]].value = result["last_actual_date"]
+            row_changed = True
+
+        # review end date — set when all steps have review dates and field is blank
+        if ("review_end" in c
+                and result.get("all_review_complete")
+                and result.get("last_review_date")
+                and not row[c["review_end"]].value):
+            row[c["review_end"]].value = result["last_review_date"]
             row_changed = True
 
         # execution status
@@ -836,62 +883,71 @@ def update_cycle_list(cycle_list_path: str, script_results: dict[str, dict], *,
 # ─────────────────────────────────────────────────────────────
 # REMINDER DETECTION
 # ─────────────────────────────────────────────────────────────
-def get_reminders(cycle_list_path: str, today: date, *, profile: dict | None = None) -> list[dict]:
+def get_reminders(cycle_list_path: str, today: date, *, profile: dict | None = None,
+                  time_slot: str = "morning") -> list[dict]:
     """
-    Scan cycle list for cycles needing attention:
-    - upcoming:  plan start within N days, not yet started
-    - overdue:   plan end has passed, not complete
-    - stalled:   in progress, plan end within last 5 days, no actual end
+    Scan cycle list for cycles needing attention based on the notification time slot.
+
+    time_slot values and the reminder types each produces:
+      "morning" / "midday"  (9:00 and 12:00 runs)
+        • "overdue"         — plan_end is today or in the past, cycle not complete
+        • "starting_today"  — plan_start is today, cycle not yet started
+
+      "evening"             (17:00 run — all of the above plus)
+        • "starting_tomorrow" — plan_start is tomorrow, cycle not yet started
+        • "due_tomorrow"      — plan_end is tomorrow, cycle not complete
     """
     p = profile or get_active_profile()
     wb = openpyxl.load_workbook(cycle_list_path, read_only=True, data_only=True)
     ws = wb[p["cycle_sheet_name"]]
     c = p["cycle_cols"]
     hdr = p["cycle_header_rows"]
-    days_ahead = CONFIG["reminder_days_ahead"]
+    tomorrow = today + timedelta(days=1)
     reminders = []
 
     for row in ws.iter_rows(min_row=hdr + 1, values_only=True):
         if not row:
             continue
 
-        # Reconstruct cycle ID from area + seq_no
         area_val = row[c["area"]]
         seq_val  = row[c["seq_no"]]
         cycle_id = reconstruct_cycle_id(area_val, seq_val, profile=p)
         if not cycle_id:
             continue
 
-        # Skip sentinel rows
         raw_col0 = str(row[c["cycle_id"]] or "").strip()
         if raw_col0 in ("e", "テストサイクルID", "Test cycle ID"):
             continue
 
-        # Skip deleted (col 9), NOT regression (col 8)
         if row[c["deletion_flag"]] == "X":
             continue
 
-        status     = row[c["exec_status"]]     or STATUS["not_started"]
+        status     = row[c["exec_status"]] or STATUS["not_started"]
         plan_start = row[c["plan_start_latest"]]
         plan_end   = row[c["plan_end_latest"]]
-        actual_end = row[c["actual_end"]]
         executor   = row[c["executor"]]
 
         if isinstance(plan_start, datetime): plan_start = plan_start.date()
         if isinstance(plan_end,   datetime): plan_end   = plan_end.date()
 
-        # Skip completed or cancelled
         if status in (STATUS["complete"], STATUS["cancelled"]):
             continue
 
         reminder_type = None
 
-        if plan_start and 0 <= (plan_start - today).days <= days_ahead:
-            reminder_type = "upcoming"
-        elif plan_end and plan_end < today and not actual_end:
+        # Always included (morning / midday / evening)
+        if plan_end and plan_end <= today:
+            # Plan end is today or overdue from previous days
             reminder_type = "overdue"
-        elif status == STATUS["in_progress"] and plan_end and 0 <= (today - plan_end).days <= 5:
-            reminder_type = "stalled"
+        elif plan_start and plan_start == today and status == STATUS["not_started"]:
+            reminder_type = "starting_today"
+
+        # Evening-only additions
+        elif time_slot == "evening":
+            if plan_start and plan_start == tomorrow and status == STATUS["not_started"]:
+                reminder_type = "starting_tomorrow"
+            elif plan_end and plan_end == tomorrow:
+                reminder_type = "due_tomorrow"
 
         if reminder_type:
             reminders.append({
@@ -906,6 +962,257 @@ def get_reminders(cycle_list_path: str, today: date, *, profile: dict | None = N
 
     wb.close()
     return reminders
+
+
+# ─────────────────────────────────────────────────────────────
+# REPORT DATA HELPERS
+# ─────────────────────────────────────────────────────────────
+def _get_date_from_row(row: tuple, col_key: str, col_map: dict) -> date | None:
+    """Safely extract a date value from a values_only row tuple by column key."""
+    idx = col_map.get(col_key)
+    if idx is None or idx >= len(row):
+        return None
+    val = row[idx]
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    return None
+
+
+def read_cycle_data(cycle_list_path: str, *, profile: dict | None = None) -> list[dict]:
+    """
+    Read all active (non-deleted, non-cancelled) cycles from the cycle list.
+    Returns a list of dicts with all fields needed for reporting.
+    """
+    p = profile or get_active_profile()
+    wb = openpyxl.load_workbook(cycle_list_path, read_only=True, data_only=True)
+    ws = wb[p["cycle_sheet_name"]]
+    c = p["cycle_cols"]
+    hdr = p["cycle_header_rows"]
+    cycles: list[dict] = []
+
+    for row in ws.iter_rows(min_row=hdr + 1, values_only=True):
+        if not row:
+            continue
+
+        area_val = row[c["area"]] if c["area"] < len(row) else None
+        seq_val  = row[c["seq_no"]] if c["seq_no"] < len(row) else None
+        cycle_id = reconstruct_cycle_id(area_val, seq_val, profile=p)
+        if not cycle_id:
+            continue
+
+        raw_col0 = str(row[c["cycle_id"]] or "").strip()
+        if raw_col0 in ("e", "テストサイクルID", "Test cycle ID"):
+            continue
+
+        if row[c["deletion_flag"]] == "X":
+            continue
+
+        status = row[c["exec_status"]] or STATUS["not_started"]
+        if status == STATUS["cancelled"]:
+            continue
+
+        executor_raw = row[c["executor"]] if c["executor"] < len(row) else None
+        cycles.append({
+            "cycle_id":       cycle_id,
+            "cycle_name":     row[c["cycle_name"]] if c["cycle_name"] < len(row) else None,
+            "area":           str(area_val).strip() if area_val else "Unknown",
+            "executor":       str(executor_raw).strip() if executor_raw else None,
+            "exec_status":    status,
+            "plan_start":     _get_date_from_row(row, "plan_start_latest", c),
+            "plan_end":       _get_date_from_row(row, "plan_end_latest",   c),
+            "actual_start":   _get_date_from_row(row, "actual_start",      c),
+            "actual_end":     _get_date_from_row(row, "actual_end",        c),
+            "review_end":     _get_date_from_row(row, "review_end",        c),
+            "review_plan_end":_get_date_from_row(row, "review_plan_end",   c),
+            "total_steps":    row[c["total_steps"]]    if c["total_steps"]    < len(row) else 0,
+            "complete_steps": row[c["complete_steps"]] if c["complete_steps"] < len(row) else 0,
+        })
+
+    wb.close()
+    return cycles
+
+
+def build_daywise_report(cycle_list_path: str, *, profile: dict | None = None) -> dict:
+    """
+    Build cumulative day-by-day execution progress data for charting.
+
+    Returns:
+        {
+          "total":  int,
+          "dates":  list[str]  (MM/DD formatted, sorted),
+          "series": {series_label: list[int]}  (cumulative count per date)
+        }
+    Series labels: Start Plan, Start Actual, Comp Plan(Exe), Comp Actual(Exe),
+                   Comp Plan(Review) [if review_plan_end present], Comp Actual(Review)
+    """
+    cycles = read_cycle_data(cycle_list_path, profile=profile)
+    total = len(cycles)
+    if not total:
+        return {"total": 0, "dates": [], "series": {}}
+
+    # Collect all meaningful dates to define the x-axis range
+    all_dates: set[date] = set()
+    for cyc in cycles:
+        for d in (cyc["plan_start"], cyc["plan_end"], cyc["actual_start"],
+                  cyc["actual_end"], cyc["review_end"], cyc["review_plan_end"]):
+            if d:
+                all_dates.add(d)
+
+    if not all_dates:
+        return {"total": total, "dates": [], "series": {}}
+
+    sorted_dates = sorted(all_dates)
+    has_review_plan = any(cyc["review_plan_end"] for cyc in cycles)
+
+    series: dict[str, list[int]] = {
+        "Start Plan":          [],
+        "Start Actual":        [],
+        "Comp Plan(Exe)":      [],
+        "Comp Actual(Exe)":    [],
+        "Comp Actual(Review)": [],
+    }
+    if has_review_plan:
+        series["Comp Plan(Review)"] = []
+
+    for d in sorted_dates:
+        series["Start Plan"].append(
+            sum(1 for cyc in cycles if cyc["plan_start"] and cyc["plan_start"] <= d))
+        series["Start Actual"].append(
+            sum(1 for cyc in cycles if cyc["actual_start"] and cyc["actual_start"] <= d))
+        series["Comp Plan(Exe)"].append(
+            sum(1 for cyc in cycles if cyc["plan_end"] and cyc["plan_end"] <= d))
+        series["Comp Actual(Exe)"].append(
+            sum(1 for cyc in cycles if cyc["actual_end"] and cyc["actual_end"] <= d))
+        series["Comp Actual(Review)"].append(
+            sum(1 for cyc in cycles if cyc["review_end"] and cyc["review_end"] <= d))
+        if has_review_plan:
+            series["Comp Plan(Review)"].append(
+                sum(1 for cyc in cycles if cyc["review_plan_end"] and cyc["review_plan_end"] <= d))
+
+    return {
+        "total":  total,
+        "dates":  [d.strftime("%m/%d") for d in sorted_dates],
+        "series": series,
+    }
+
+
+def _workstream_summary(cycles: list[dict], group_key: str) -> list[dict]:
+    """
+    Shared logic for streamwise / executorwise reports.
+    Groups cycles by `group_key` and computes execution + review metrics.
+    """
+    today = date.today()
+    groups: dict[str, list[dict]] = {}
+    for cyc in cycles:
+        key = cyc.get(group_key) or "Unknown"
+        groups.setdefault(key, []).append(cyc)
+
+    rows: list[dict] = []
+    totals = {"total": 0, "exec_plan": 0, "exec_actual": 0,
+              "exec_ahead": 0, "exec_delay": 0,
+              "review_actual": 0, "review_ahead": 0, "review_delay": 0}
+
+    for group_name in sorted(groups):
+        grp = groups[group_name]
+        total = len(grp)
+        # Execution
+        exec_actual = sum(1 for cyc in grp if cyc["actual_end"])
+        exec_plan   = sum(1 for cyc in grp if cyc["plan_end"])   # cycles that have a planned end
+        exec_ahead  = sum(1 for cyc in grp
+                          if cyc["actual_end"] and cyc["plan_end"]
+                          and cyc["actual_end"] <= cyc["plan_end"])
+        exec_delay  = sum(1 for cyc in grp
+                          if (not cyc["actual_end"] and cyc["plan_end"] and cyc["plan_end"] < today)
+                          or (cyc["actual_end"] and cyc["plan_end"]
+                              and cyc["actual_end"] > cyc["plan_end"]))
+        # Review
+        review_actual = sum(1 for cyc in grp if cyc["review_end"])
+        review_ahead  = sum(1 for cyc in grp
+                            if cyc["review_end"] and cyc["review_plan_end"]
+                            and cyc["review_end"] <= cyc["review_plan_end"])
+        review_delay  = sum(1 for cyc in grp
+                            if (not cyc["review_end"] and cyc["review_plan_end"]
+                                and cyc["review_plan_end"] < today)
+                            or (cyc["review_end"] and cyc["review_plan_end"]
+                                and cyc["review_end"] > cyc["review_plan_end"]))
+
+        row = {
+            group_key:      group_name,
+            "total":        total,
+            "exec_plan":    exec_plan,
+            "exec_actual":  exec_actual,
+            "exec_ahead":   exec_ahead,
+            "exec_delay":   exec_delay,
+            "review_actual": review_actual,
+            "review_ahead":  review_ahead,
+            "review_delay":  review_delay,
+        }
+        rows.append(row)
+        for k in ("total", "exec_plan", "exec_actual", "exec_ahead", "exec_delay",
+                  "review_actual", "review_ahead", "review_delay"):
+            totals[k] += row[k]
+
+    totals[group_key] = "Total"
+    rows.append(totals)
+    return rows
+
+
+def build_streamwise_report(cycle_list_path: str, *, profile: dict | None = None) -> list[dict]:
+    """
+    Workstream (area) breakdown: total cycles vs execution/review plan & actual counts.
+    Each row: area, total, exec_plan, exec_actual, exec_ahead, exec_delay,
+              review_actual, review_ahead, review_delay.
+    Last row is the "Total" summary.
+    """
+    cycles = read_cycle_data(cycle_list_path, profile=profile)
+    return _workstream_summary(cycles, "area")
+
+
+def build_executorwise_report(cycle_list_path: str, *, profile: dict | None = None) -> list[dict]:
+    """
+    Executor breakdown: same columns as streamwise but grouped by executor name.
+    Cycles with multiple executors (comma-separated) are counted once per executor.
+    Last row is the "Total" summary.
+    """
+    cycles = read_cycle_data(cycle_list_path, profile=profile)
+    # Expand multi-executor cycles
+    expanded: list[dict] = []
+    for cyc in cycles:
+        if cyc["executor"]:
+            for name in [n.strip() for n in str(cyc["executor"]).split(",") if n.strip()]:
+                expanded.append({**cyc, "executor": name})
+        else:
+            expanded.append({**cyc, "executor": "Unassigned"})
+    return _workstream_summary(expanded, "executor")
+
+
+def build_cycle_step_report(cycle_list_path: str, *, profile: dict | None = None) -> list[dict]:
+    """
+    Per-cycle progress table.
+    Returns a list of dicts suitable for display as a dataframe.
+    """
+    cycles = read_cycle_data(cycle_list_path, profile=profile)
+    rows = []
+    for cyc in cycles:
+        total    = cyc["total_steps"]    or 0
+        complete = cyc["complete_steps"] or 0
+        pct = f"{int(complete/total*100)}%" if total else "—"
+        rows.append({
+            "Cycle ID":      cyc["cycle_id"],
+            "Name":          cyc["cycle_name"],
+            "Area":          cyc["area"],
+            "Executor":      cyc["executor"] or "—",
+            "Status":        cyc["exec_status"],
+            "Steps":         f"{complete}/{total} ({pct})",
+            "Plan Start":    str(cyc["plan_start"])  if cyc["plan_start"]  else "—",
+            "Plan End":      str(cyc["plan_end"])    if cyc["plan_end"]    else "—",
+            "Actual Start":  str(cyc["actual_start"])if cyc["actual_start"]else "—",
+            "Actual End":    str(cyc["actual_end"])  if cyc["actual_end"]  else "—",
+            "Review End":    str(cyc["review_end"])  if cyc["review_end"]  else "—",
+        })
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1009,12 +1316,14 @@ def build_manager_report(changes: list[dict], reminders: list[dict], today: date
                           missing_scripts: list[dict] | None = None) -> str:
     """Build an HTML daily summary email for the manager."""
     missing_scripts = missing_scripts or []
-    completed = [c for c in changes if c["new_status"] == STATUS["complete"]]
-    started   = [c for c in changes if c["new_status"] == STATUS["in_progress"]
-                                    and c["old_status"] == STATUS["not_started"]]
-    overdue   = [r for r in reminders if r["type"] == "overdue"]
-    upcoming  = [r for r in reminders if r["type"] == "upcoming"]
-    stalled   = [r for r in reminders if r["type"] == "stalled"]
+    completed       = [c for c in changes  if c["new_status"] == STATUS["complete"]]
+    in_review       = [c for c in changes  if c["new_status"] == STATUS["reviewing"]]
+    started         = [c for c in changes  if c["new_status"] == STATUS["in_progress"]
+                                           and c["old_status"] == STATUS["not_started"]]
+    overdue         = [r for r in reminders if r["type"] == "overdue"]
+    starting_today  = [r for r in reminders if r["type"] == "starting_today"]
+    st_tomorrow     = [r for r in reminders if r["type"] == "starting_tomorrow"]
+    due_tomorrow    = [r for r in reminders if r["type"] == "due_tomorrow"]
 
     def table(rows, cols):
         html = '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px">'
@@ -1028,17 +1337,17 @@ def build_manager_report(changes: list[dict], reminders: list[dict], today: date
     <div style="font-family:Arial,sans-serif;max-width:900px">
     <h2 style="color:#4a4a8a">📊 SAP Test Cycle Daily Report — {today.strftime('%Y/%m/%d')}</h2>
     <p style="font-size:15px">
-      <b>✅ Newly completed:</b> {len(completed)} &nbsp;|&nbsp;
-      <b>🚀 Newly started:</b> {len(started)} &nbsp;|&nbsp;
+      <b>✅ Completed:</b> {len(completed)} &nbsp;|&nbsp;
+      <b>🔍 In Review:</b> {len(in_review)} &nbsp;|&nbsp;
+      <b>🚀 Started:</b> {len(started)} &nbsp;|&nbsp;
       <b>🔴 Overdue:</b> {len(overdue)} &nbsp;|&nbsp;
-      <b>⏰ Stalled:</b> {len(stalled)} &nbsp;|&nbsp;
-      <b>📅 Upcoming ({CONFIG['reminder_days_ahead']}d):</b> {len(upcoming)} &nbsp;|&nbsp;
+      <b>🟢 Starting Today:</b> {len(starting_today)} &nbsp;|&nbsp;
       <b>⚠️ No script:</b> {len(missing_scripts)}
     </p>
     """
 
     if completed:
-        html += "<h3 style='color:green'>✅ Completed Today</h3>"
+        html += "<h3 style='color:green'>✅ Completed (Review Done)</h3>"
         html += table(
             [(c["cycle_id"], c["cycle_name"], c["area"],
               f"{c['completed_steps']}/{c['total_steps']}", c["executor"] or "-")
@@ -1046,27 +1355,46 @@ def build_manager_report(changes: list[dict], reminders: list[dict], today: date
             ["Cycle ID", "Name", "Area", "Steps", "Executor"]
         )
 
+    if in_review:
+        html += "<h3 style='color:#0077cc'>🔍 Moved to In Review</h3>"
+        html += table(
+            [(c["cycle_id"], c["cycle_name"], c["area"],
+              f"{c['completed_steps']}/{c['total_steps']}", c["executor"] or "-")
+             for c in in_review],
+            ["Cycle ID", "Name", "Area", "Steps", "Executor"]
+        )
+
     if overdue:
         html += "<h3 style='color:red'>🔴 Overdue — Action Required</h3>"
         html += table(
-            [(r["cycle_id"], r["cycle_name"], str(r["plan_end"]), r["executor"] or "-", r["status"])
+            [(r["cycle_id"], r["cycle_name"], str(r["plan_end"] or "-"),
+              r["executor"] or "-", r["status"])
              for r in overdue],
             ["Cycle ID", "Name", "Plan End", "Executor", "Status"]
         )
 
-    if stalled:
-        html += "<h3 style='color:orange'>⏰ Stalled — Please Follow Up</h3>"
+    if due_tomorrow:
+        html += "<h3 style='color:orange'>⚡ Due Tomorrow</h3>"
         html += table(
-            [(r["cycle_id"], r["cycle_name"], str(r["plan_end"]), r["executor"] or "-")
-             for r in stalled],
-            ["Cycle ID", "Name", "Plan End", "Executor"]
+            [(r["cycle_id"], r["cycle_name"], str(r["plan_end"] or "-"),
+              r["executor"] or "-", r["status"])
+             for r in due_tomorrow],
+            ["Cycle ID", "Name", "Plan End", "Executor", "Status"]
         )
 
-    if upcoming:
-        html += f"<h3 style='color:#4a4a8a'>📅 Starting within {CONFIG['reminder_days_ahead']} days</h3>"
+    if starting_today:
+        html += "<h3 style='color:#2e7d32'>🟢 Starting Today</h3>"
         html += table(
-            [(r["cycle_id"], r["cycle_name"], str(r["plan_start"]), r["executor"] or "-")
-             for r in upcoming],
+            [(r["cycle_id"], r["cycle_name"], str(r["plan_start"] or "-"), r["executor"] or "-")
+             for r in starting_today],
+            ["Cycle ID", "Name", "Plan Start", "Executor"]
+        )
+
+    if st_tomorrow:
+        html += "<h3 style='color:#1565c0'>📅 Starting Tomorrow</h3>"
+        html += table(
+            [(r["cycle_id"], r["cycle_name"], str(r["plan_start"] or "-"), r["executor"] or "-")
+             for r in st_tomorrow],
             ["Cycle ID", "Name", "Plan Start", "Executor"]
         )
 
@@ -1095,18 +1423,30 @@ def build_manager_report(changes: list[dict], reminders: list[dict], today: date
 def build_executor_reminder(reminder: dict) -> str:
     """Build an HTML reminder email for an individual executor."""
     r = reminder
-    if r["type"] == "upcoming":
-        heading = f"📅 Upcoming Test Cycle — {r['cycle_id']}"
-        msg = f"""Your test cycle <b>{r['cycle_id']} — {r['cycle_name']}</b> is scheduled
-        to start on <b>{r['plan_start']}</b>.<br><br>
-        Please make sure your test data and SAP environment are ready before the start date.
-        Check the condition script file and confirm all pre-conditions are met."""
-    elif r["type"] == "overdue":
-        heading = f"⚠️ Overdue Test Cycle — {r['cycle_id']}"
+    if r["type"] == "overdue":
+        heading = f"🔴 Overdue Test Cycle — {r['cycle_id']}"
         msg = f"""Your test cycle <b>{r['cycle_id']} — {r['cycle_name']}</b> was due by
-        <b>{r['plan_end']}</b> and has not been marked complete.<br><br>
+        <b>{r['plan_end']}</b> and has not been completed.<br><br>
         Please update the condition script with your execution results (actual dates + OK/NG)
         as soon as possible. Current status: <b>{r['status']}</b>."""
+    elif r["type"] == "starting_today":
+        heading = f"🟢 Test Cycle Starts Today — {r['cycle_id']}"
+        msg = f"""Your test cycle <b>{r['cycle_id']} — {r['cycle_name']}</b> is scheduled
+        to start <b>today ({r['plan_start']})</b>.<br><br>
+        Please make sure your test data and SAP environment are ready.
+        Check the condition script and confirm all pre-conditions are met before starting."""
+    elif r["type"] == "starting_tomorrow":
+        heading = f"📅 Test Cycle Starts Tomorrow — {r['cycle_id']}"
+        msg = f"""Your test cycle <b>{r['cycle_id']} — {r['cycle_name']}</b> is scheduled
+        to start <b>tomorrow ({r['plan_start']})</b>.<br><br>
+        Please prepare your test environment and review the condition script today
+        so you can start on time tomorrow."""
+    elif r["type"] == "due_tomorrow":
+        heading = f"⚡ Test Cycle Due Tomorrow — {r['cycle_id']}"
+        msg = f"""Your test cycle <b>{r['cycle_id']} — {r['cycle_name']}</b> is due for
+        completion by <b>tomorrow ({r['plan_end']})</b>.<br><br>
+        Please ensure all steps are executed and results (actual dates + OK/NG) are entered
+        in the condition script before end of day. Current status: <b>{r['status']}</b>."""
     else:
         heading = f"🔄 Please Update Test Results — {r['cycle_id']}"
         msg = f"""Test cycle <b>{r['cycle_id']} — {r['cycle_name']}</b> is in progress
@@ -1129,7 +1469,18 @@ def build_executor_reminder(reminder: dict) -> str:
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
-def run():
+def run(time_slot: str = "morning"):
+    """
+    Main orchestration function.
+
+    Parameters
+    ----------
+    time_slot : str
+        Controls which reminder types are sent:
+          "morning"  — overdue + starting today            (for 9:00 run)
+          "midday"   — same as morning                     (for 12:00 run)
+          "evening"  — morning + starting tomorrow + due tomorrow  (for 17:00 run)
+    """
     setup_logging()
     today = date.today()
     log.info(f"{'='*60}")
@@ -1182,8 +1533,9 @@ def run():
             log.warning(f"  No script: {m['cycle_id']}  ({m['cycle_name']})")
     # OneDrive will auto-sync the updated file to SharePoint
 
-    # 4. Get reminders
-    reminders = get_reminders(cycle_list_path, today, profile=profile)
+    # 4. Get reminders (criteria depend on the time slot)
+    log.info(f"Time slot: {time_slot}")
+    reminders = get_reminders(cycle_list_path, today, profile=profile, time_slot=time_slot)
     log.info(f"Reminders: {len(reminders)} cycles need attention")
 
     # 5. Send individual executor reminders
@@ -1228,4 +1580,10 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    import sys
+    # Optionally pass a time slot as the first argument:
+    #   python AT_Sentinel.py morning   → overdue + starting today
+    #   python AT_Sentinel.py midday    → same as morning
+    #   python AT_Sentinel.py evening   → morning + starting tomorrow + due tomorrow
+    slot = sys.argv[1] if len(sys.argv) > 1 else "morning"
+    run(time_slot=slot)
