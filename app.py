@@ -21,7 +21,8 @@ from AT_Sentinel import (
     load_profiles, save_profiles,
     read_cycle_data, build_daywise_report,
     build_streamwise_report, build_executorwise_report,
-    build_cycle_step_report,
+    build_cycle_step_report, build_merged_condition_report,
+    get_executor_reminder_data, build_review_reminder, build_remark_reminder,
     STATUS, CONFIG, DEFAULT_PROFILES,
 )
 
@@ -329,7 +330,7 @@ run_profile = load_profiles().get(
     DEFAULT_PROFILES.get(active_profile_name, DEFAULT_PROFILES["AT-SAP"]),
 )
 
-tab_run, tab_reports = st.tabs(["▶ Run", "📊 Reports"])
+tab_run, tab_reminders, tab_reports = st.tabs(["▶ Run", "🔔 Reminders", "📊 Reports"])
 
 # ── RUN TAB ───────────────────────────────────────────────────────────────────
 with tab_run:
@@ -359,8 +360,9 @@ with tab_run:
                 st.error("No condition script files found. Check the profile's **condition_script_pattern**.")
                 st.stop()
 
-            # Store for Reports tab
+            # Store for Reports and Reminders tabs
             st.session_state["last_cycle_list_path"] = cycle_list_path
+            st.session_state["last_script_paths"]    = script_paths
             st.write(f"✅ Found **{len(script_paths)}** condition script(s)")
 
             # 2 — Analyze scripts
@@ -519,61 +521,231 @@ with tab_run:
                 "Current Status": "exec_status", "Executor": "executor",
             }, f"⚠️ No Script Found ({len(missing_scripts)})")
 
+# ── REMINDERS TAB ─────────────────────────────────────────────────────────────
+with tab_reminders:
+    st.subheader("🔔 Send Reminders")
+    st.caption("Send targeted reminders to individual executors for execution and/or review tasks.")
+
+    rem_cycle_path = st.session_state.get("last_cycle_list_path")
+    if not rem_cycle_path:
+        st.info("Run a sync first, or click **Load Data** to scan the folder.")
+        if st.button("📁 Load Data", key="load_reminders"):
+            with st.spinner("Scanning folder…"):
+                cl, sps = find_files(folder, profile=run_profile)
+                if cl:
+                    st.session_state["last_cycle_list_path"] = cl
+                    st.session_state["last_script_paths"]    = sps
+                    st.rerun()
+                else:
+                    st.error("Cycle list not found.")
+
+    if rem_cycle_path:
+        try:
+            rem_data = get_executor_reminder_data(rem_cycle_path, date.today(),
+                                                   profile=run_profile)
+        except Exception as e:
+            st.error(f"Could not load reminder data: {e}")
+            rem_data = {}
+
+        if not rem_data:
+            st.success("No pending reminders — all cycles are on track.")
+        else:
+            # ── Summary table ──
+            summary = [
+                {"Executor":        name,
+                 "Exec Pending":    len(v["exec_cycles"]),
+                 "Review Pending":  len(v["review_cycles"])}
+                for name, v in sorted(rem_data.items())
+            ]
+            st.dataframe(summary, use_container_width=True)
+
+            st.divider()
+
+            # ── Executor selector ──
+            all_executors = list(rem_data.keys())
+            selected = st.multiselect(
+                "Select executors to send reminders to:",
+                options=all_executors,
+                default=all_executors,
+                help="Choose specific executors or keep all selected.",
+            )
+
+            # ── Reminder type ──
+            c1, c2, c3 = st.columns(3)
+            send_exec   = c1.checkbox("Execution reminders",  value=True)
+            send_review = c2.checkbox("Review reminders",     value=True)
+            send_remark = c3.checkbox("Remark filling reminder", value=False)
+
+            st.divider()
+
+            # ── Preview ──
+            if selected:
+                with st.expander("📋 Preview — cycles that will be notified"):
+                    for name in selected:
+                        v = rem_data[name]
+                        st.markdown(f"**{name}**")
+                        if send_exec and v["exec_cycles"]:
+                            st.markdown("*Execution:*")
+                            for cyc in v["exec_cycles"]:
+                                st.markdown(
+                                    f"  - {cyc['cycle_id']} | {cyc['exec_status']} "
+                                    f"| Plan End: {cyc['plan_end'] or '—'}")
+                        if send_review and v["review_cycles"]:
+                            st.markdown("*Review:*")
+                            for cyc in v["review_cycles"]:
+                                st.markdown(
+                                    f"  - {cyc['cycle_id']} | Review Plan End: "
+                                    f"{cyc.get('review_plan_end') or '—'}")
+
+            # ── Send buttons ──
+            col_sel, col_all = st.columns(2)
+            send_selected = col_sel.button("📨 Send to Selected", type="primary",
+                                            disabled=not selected or dry_run)
+            send_all      = col_all.button("📨 Send to All",
+                                            disabled=dry_run)
+
+            if dry_run:
+                st.warning("🔵 Dry Run ON — no emails will be sent.")
+
+            def _do_send(targets: list[str]):
+                sent = 0
+                for name in targets:
+                    email_addr = resolve_email(name)
+                    if not email_addr:
+                        st.warning(f"No email mapping for '{name}' — skipping.")
+                        continue
+                    v = rem_data.get(name, {})
+                    if send_exec:
+                        for cyc in v.get("exec_cycles", []):
+                            from AT_Sentinel import build_executor_reminder as _ber
+                            reminder_dict = {
+                                "type": "overdue" if (cyc["plan_end"] and cyc["plan_end"] < date.today())
+                                         else "starting_today",
+                                "cycle_id": cyc["cycle_id"], "cycle_name": cyc["cycle_name"],
+                                "plan_start": cyc["plan_start"], "plan_end": cyc["plan_end"],
+                                "status": cyc["exec_status"],
+                            }
+                            notify(email_addr,
+                                   f"[SAP Test] Execution Reminder — {cyc['cycle_id']} ({name})",
+                                   _ber(reminder_dict), post_to_teams=False)
+                            sent += 1
+                    if send_review:
+                        for cyc in v.get("review_cycles", []):
+                            notify(email_addr,
+                                   f"[SAP Test] Review Reminder — {cyc['cycle_id']} ({name})",
+                                   build_review_reminder(cyc), post_to_teams=False)
+                            sent += 1
+                    if send_remark:
+                        all_cycs = v.get("exec_cycles", []) + v.get("review_cycles", [])
+                        for cyc in all_cycs:
+                            notify(email_addr,
+                                   f"[SAP Test] Remark Filling — {cyc['cycle_id']} ({name})",
+                                   build_remark_reminder(cyc), post_to_teams=False)
+                            sent += 1
+                return sent
+
+            if send_selected and selected:
+                with st.spinner("Sending reminders…"):
+                    n = _do_send(selected)
+                st.success(f"✅ Sent {n} reminder(s) to {len(selected)} executor(s).")
+
+            if send_all:
+                with st.spinner("Sending reminders to all…"):
+                    n = _do_send(all_executors)
+                st.success(f"✅ Sent {n} reminder(s) to {len(all_executors)} executor(s).")
+
+
 # ── REPORTS TAB ───────────────────────────────────────────────────────────────
 with tab_reports:
     st.subheader("📊 Reports")
 
-    report_cycle_path = st.session_state.get("last_cycle_list_path")
+    report_cycle_path  = st.session_state.get("last_cycle_list_path")
+    report_script_paths = st.session_state.get("last_script_paths", [])
 
     if not report_cycle_path:
         st.info("Run a sync first, or click **Load Data** to scan the configured folder.")
         if st.button("📁 Load Data", key="load_reports"):
             with st.spinner("Scanning folder for cycle list…"):
-                cl, _ = find_files(folder, profile=run_profile)
+                cl, sps = find_files(folder, profile=run_profile)
                 if cl:
                     st.session_state["last_cycle_list_path"] = cl
+                    st.session_state["last_script_paths"]    = sps
                     st.rerun()
                 else:
                     st.error("Cycle list not found. Check folder path and profile settings.")
 
     if report_cycle_path:
         st.caption(f"Data source: `{report_cycle_path}`")
-        try:
-            r1, r2, r3, r4 = st.tabs(
-                ["📋 Cycle & Step", "📅 Daywise", "🏢 Streamwise", "👤 Executorwise"]
-            )
 
-            with r1:
+        # ── Dropdown selector (spec: "dropdown to select which data to see") ──
+        report_choice = st.selectbox(
+            "Select report:",
+            options=[
+                "📋 Cycle & Step Basis",
+                "📄 Merged Condition File",
+                "📅 Execution Status — Daywise",
+                "🏢 Execution Status — Streamwise",
+                "👤 Execution Status — Executorwise",
+            ],
+        )
+
+        try:
+            if report_choice == "📋 Cycle & Step Basis":
                 st.markdown("**Per-cycle execution and review progress**")
                 cycle_rows = build_cycle_step_report(report_cycle_path, profile=run_profile)
                 if cycle_rows:
                     st.dataframe(cycle_rows, use_container_width=True)
                     st.caption(f"Total active cycles: {len(cycle_rows)}")
+                    csv = pd.DataFrame(cycle_rows).to_csv(index=False).encode("utf-8")
+                    st.download_button("⬇️ Download CSV", csv, "cycle_step_report.csv", "text/csv")
                 else:
                     st.info("No cycle data found.")
 
-            with r2:
-                st.markdown("**Cumulative execution progress by date**")
+            elif report_choice == "📄 Merged Condition File":
+                st.markdown("**All test steps merged from every condition script**")
+                if report_script_paths:
+                    with st.spinner("Merging condition scripts…"):
+                        merged = build_merged_condition_report(report_script_paths, profile=run_profile)
+                    if merged:
+                        df_merged = pd.DataFrame(merged)
+                        st.dataframe(df_merged, use_container_width=True)
+                        st.caption(f"Total steps: {len(merged)} across {len(report_script_paths)} scripts")
+                        csv = df_merged.to_csv(index=False).encode("utf-8")
+                        st.download_button("⬇️ Download CSV", csv, "merged_condition_report.csv", "text/csv")
+                    else:
+                        st.info("No step data found.")
+                else:
+                    st.warning("No script paths available. Run a sync first to load scripts.")
+
+            elif report_choice == "📅 Execution Status — Daywise":
+                st.markdown("**Cumulative execution progress by date (planned vs. actual)**")
                 daywise = build_daywise_report(report_cycle_path, profile=run_profile)
                 if daywise["dates"]:
                     df_day = pd.DataFrame(daywise["series"], index=daywise["dates"])
                     st.line_chart(df_day, use_container_width=True)
-                    st.caption(f"Total cycles tracked: {daywise['total']}")
+                    st.caption(f"Total cycles: {daywise['total']}")
                     with st.expander("Show data table"):
                         st.dataframe(df_day, use_container_width=True)
+                        csv = df_day.to_csv().encode("utf-8")
+                        st.download_button("⬇️ Download CSV", csv, "daywise_report.csv", "text/csv")
                 else:
-                    st.info("No date data available. Ensure plan/actual dates are populated in the cycle list.")
+                    st.info("No date data available.")
 
-            with r3:
-                st.markdown("**Execution and review completion by workstream**")
+            elif report_choice == "🏢 Execution Status — Streamwise":
+                st.markdown("**Planned till date, Actual till date, Ahead, Delayed — by workstream**")
                 stream_rows = build_streamwise_report(report_cycle_path, profile=run_profile)
                 if stream_rows:
                     display = [
-                        {"Workstream": r["area"], "Total": r["total"],
-                         "Exec Plan": r["exec_plan"], "Exec Actual": r["exec_actual"],
-                         "Exec Ahead": r["exec_ahead"], "Exec Delay": r["exec_delay"],
-                         "Review Actual": r["review_actual"], "Review Ahead": r["review_ahead"],
-                         "Review Delay": r["review_delay"]}
+                        {"Workstream":     r["area"],
+                         "Total":          r["total"],
+                         "Exec Plan":      r["exec_plan"],
+                         "Exec Actual":    r["exec_actual"],
+                         "Exec Ahead":     r["exec_ahead"],
+                         "Exec Delay":     r["exec_delay"],
+                         "Review Plan":    r["review_plan"],
+                         "Review Actual":  r["review_actual"],
+                         "Review Ahead":   r["review_ahead"],
+                         "Review Delay":   r["review_delay"]}
                         for r in stream_rows
                     ]
                     st.dataframe(display, use_container_width=True)
@@ -581,24 +753,31 @@ with tab_reports:
                     if chart_rows:
                         df_s = pd.DataFrame([
                             {"Workstream": r["area"],
-                             "Exec Actual": r["exec_actual"],
-                             "Review Actual": r["review_actual"]}
+                             "Exec Plan": r["exec_plan"], "Exec Actual": r["exec_actual"],
+                             "Review Plan": r["review_plan"], "Review Actual": r["review_actual"]}
                             for r in chart_rows
                         ]).set_index("Workstream")
                         st.bar_chart(df_s, use_container_width=True)
+                    csv = pd.DataFrame(display).to_csv(index=False).encode("utf-8")
+                    st.download_button("⬇️ Download CSV", csv, "streamwise_report.csv", "text/csv")
                 else:
                     st.info("No workstream data found.")
 
-            with r4:
-                st.markdown("**Execution and review completion by executor**")
+            elif report_choice == "👤 Execution Status — Executorwise":
+                st.markdown("**Planned till date, Actual till date, Ahead, Delayed — by executor**")
                 exec_rows = build_executorwise_report(report_cycle_path, profile=run_profile)
                 if exec_rows:
                     display = [
-                        {"Executor": r["executor"], "Total": r["total"],
-                         "Exec Plan": r["exec_plan"], "Exec Actual": r["exec_actual"],
-                         "Exec Ahead": r["exec_ahead"], "Exec Delay": r["exec_delay"],
-                         "Review Actual": r["review_actual"], "Review Ahead": r["review_ahead"],
-                         "Review Delay": r["review_delay"]}
+                        {"Executor":       r["executor"],
+                         "Total":          r["total"],
+                         "Exec Plan":      r["exec_plan"],
+                         "Exec Actual":    r["exec_actual"],
+                         "Exec Ahead":     r["exec_ahead"],
+                         "Exec Delay":     r["exec_delay"],
+                         "Review Plan":    r["review_plan"],
+                         "Review Actual":  r["review_actual"],
+                         "Review Ahead":   r["review_ahead"],
+                         "Review Delay":   r["review_delay"]}
                         for r in exec_rows
                     ]
                     st.dataframe(display, use_container_width=True)
@@ -606,16 +785,18 @@ with tab_reports:
                     if chart_rows:
                         df_e = pd.DataFrame([
                             {"Executor": r["executor"],
-                             "Exec Actual": r["exec_actual"],
-                             "Review Actual": r["review_actual"]}
+                             "Exec Plan": r["exec_plan"], "Exec Actual": r["exec_actual"],
+                             "Review Plan": r["review_plan"], "Review Actual": r["review_actual"]}
                             for r in chart_rows
                         ]).set_index("Executor")
                         st.bar_chart(df_e, use_container_width=True)
+                    csv = pd.DataFrame(display).to_csv(index=False).encode("utf-8")
+                    st.download_button("⬇️ Download CSV", csv, "executorwise_report.csv", "text/csv")
                 else:
                     st.info("No executor data found.")
 
         except Exception as e:
-            st.error(f"Could not generate reports: {e}")
+            st.error(f"Could not generate report: {e}")
 
 # ── Run History ────────────────────────────────────────────────────────────────
 st.divider()
