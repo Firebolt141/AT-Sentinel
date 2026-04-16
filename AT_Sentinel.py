@@ -1112,14 +1112,15 @@ def _workstream_summary(cycles: list[dict], group_key: str) -> list[dict]:
     rows: list[dict] = []
     totals = {"total": 0, "exec_plan": 0, "exec_actual": 0,
               "exec_ahead": 0, "exec_delay": 0,
-              "review_actual": 0, "review_ahead": 0, "review_delay": 0}
+              "review_plan": 0, "review_actual": 0,
+              "review_ahead": 0, "review_delay": 0}
 
     for group_name in sorted(groups):
         grp = groups[group_name]
         total = len(grp)
-        # Execution
+        # Execution — "plan" = planned to complete by today, not all that have a plan_end
+        exec_plan   = sum(1 for cyc in grp if cyc["plan_end"] and cyc["plan_end"] <= today)
         exec_actual = sum(1 for cyc in grp if cyc["actual_end"])
-        exec_plan   = sum(1 for cyc in grp if cyc["plan_end"])   # cycles that have a planned end
         exec_ahead  = sum(1 for cyc in grp
                           if cyc["actual_end"] and cyc["plan_end"]
                           and cyc["actual_end"] <= cyc["plan_end"])
@@ -1128,6 +1129,8 @@ def _workstream_summary(cycles: list[dict], group_key: str) -> list[dict]:
                           or (cyc["actual_end"] and cyc["plan_end"]
                               and cyc["actual_end"] > cyc["plan_end"]))
         # Review
+        review_plan  = sum(1 for cyc in grp
+                           if cyc["review_plan_end"] and cyc["review_plan_end"] <= today)
         review_actual = sum(1 for cyc in grp if cyc["review_end"])
         review_ahead  = sum(1 for cyc in grp
                             if cyc["review_end"] and cyc["review_plan_end"]
@@ -1139,19 +1142,20 @@ def _workstream_summary(cycles: list[dict], group_key: str) -> list[dict]:
                                 and cyc["review_end"] > cyc["review_plan_end"]))
 
         row = {
-            group_key:      group_name,
-            "total":        total,
-            "exec_plan":    exec_plan,
-            "exec_actual":  exec_actual,
-            "exec_ahead":   exec_ahead,
-            "exec_delay":   exec_delay,
+            group_key:       group_name,
+            "total":         total,
+            "exec_plan":     exec_plan,
+            "exec_actual":   exec_actual,
+            "exec_ahead":    exec_ahead,
+            "exec_delay":    exec_delay,
+            "review_plan":   review_plan,
             "review_actual": review_actual,
             "review_ahead":  review_ahead,
             "review_delay":  review_delay,
         }
         rows.append(row)
         for k in ("total", "exec_plan", "exec_actual", "exec_ahead", "exec_delay",
-                  "review_actual", "review_ahead", "review_delay"):
+                  "review_plan", "review_actual", "review_ahead", "review_delay"):
             totals[k] += row[k]
 
     totals[group_key] = "Total"
@@ -1213,6 +1217,191 @@ def build_cycle_step_report(cycle_list_path: str, *, profile: dict | None = None
             "Review End":    str(cyc["review_end"])  if cyc["review_end"]  else "—",
         })
     return rows
+
+
+def build_merged_condition_report(script_paths: list[str], *,
+                                   profile: dict | None = None) -> list[dict]:
+    """
+    Read all condition scripts and merge every active step into a flat list.
+    Used to generate the "Condensed / Merged Condition File" output.
+
+    Each row represents one test step and includes:
+      cycle_id, step_no, executor, planned_date, actual_date, result,
+      retest_date, retest_result, review_date, review_result
+    """
+    p = profile or get_active_profile()
+    c = p["script_cols"]
+    hdr = p["script_header_rows"]
+    sheet_name = p["script_sheet_name"]
+    all_steps: list[dict] = []
+
+    def _fmt(val) -> str:
+        if isinstance(val, datetime): return val.date().isoformat()
+        if isinstance(val, date):     return val.isoformat()
+        return str(val).strip() if val else ""
+
+    for filepath in script_paths:
+        cycle_id = extract_cycle_id_from_filename(Path(filepath).name, profile=p)
+        if not cycle_id:
+            continue
+        try:
+            wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+        except Exception:
+            continue
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            continue
+        ws = wb[sheet_name]
+        last_step_no = None
+
+        for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
+            if row_idx < hdr:
+                continue
+            if row and row[0] == "e":
+                break
+            if not row or all(v is None for v in row):
+                continue
+            if len(row) > c["excluded"] and row[c["excluded"]] == "X":
+                continue
+
+            step_no = row[1] if len(row) > 1 else None
+            if step_no is not None:
+                last_step_no = step_no
+
+            has_data = (
+                (len(row) > c["result"] and row[c["result"]] in ("OK", "NG", "-"))
+                or (len(row) > c["actual_date"] and row[c["actual_date"]] is not None)
+                or (len(row) > c["planned_date"] and row[c["planned_date"]] is not None)
+            )
+            if last_step_no is None and not has_data:
+                continue
+
+            def _get(col_key):
+                idx = c.get(col_key)
+                return row[idx] if idx is not None and idx < len(row) else None
+
+            retest_result = _get("retest_result")
+            first_result  = _get("result")
+            result = (retest_result
+                      if isinstance(retest_result, str) and retest_result.strip() not in ("", "-")
+                      else first_result)
+
+            all_steps.append({
+                "Cycle ID":      cycle_id,
+                "Step No":       last_step_no,
+                "Executor":      _fmt(_get("exec_pic")),
+                "Planned Date":  _fmt(_get("planned_date")),
+                "Actual Date":   _fmt(_get("actual_date")),
+                "Result":        _fmt(result) or "-",
+                "Retest Date":   _fmt(_get("retest_date")),
+                "Retest Result": _fmt(_get("retest_result")) or "-",
+                "Review Date":   _fmt(_get("review_date")),
+                "Review Result": _fmt(_get("review_result")) or "-",
+            })
+        wb.close()
+
+    return all_steps
+
+
+def get_executor_reminder_data(cycle_list_path: str, today: date, *,
+                                profile: dict | None = None) -> dict[str, dict]:
+    """
+    Return per-executor data for the selective reminder UI.
+
+    Structure:
+      {
+        "executor_name": {
+          "exec_cycles":   [cycle dicts needing execution attention],
+          "review_cycles": [cycle dicts needing review attention],
+        }
+      }
+
+    Execution attention:
+      - Status not yet started / in_progress / SIR
+      - plan_end <= today (overdue or due today) OR plan_start in (today, tomorrow)
+
+    Review attention:
+      - Status = reviewing (in review)
+      - review_plan_end <= today OR review_plan_end == tomorrow
+    """
+    tomorrow = today + timedelta(days=1)
+    cycles = read_cycle_data(cycle_list_path, profile=profile)
+    result: dict[str, dict] = {}
+
+    for cyc in cycles:
+        if cyc["exec_status"] == STATUS["cancelled"]:
+            continue
+
+        executor = cyc.get("executor")
+        if not executor:
+            continue
+
+        for name in [n.strip() for n in str(executor).split(",") if n.strip()]:
+            if name not in result:
+                result[name] = {"exec_cycles": [], "review_cycles": []}
+
+            # Execution attention: not yet complete and either overdue or starting soon
+            is_exec_done = cyc["exec_status"] in (STATUS["complete"], STATUS["reviewing"])
+            if not is_exec_done:
+                needs_exec = (
+                    (cyc["plan_end"] and cyc["plan_end"] <= today)        # overdue / due today
+                    or (cyc["plan_start"] and cyc["plan_start"] in (today, tomorrow))  # starting
+                )
+                if needs_exec:
+                    result[name]["exec_cycles"].append(cyc)
+
+            # Review attention: in-review stage, review due or overdue
+            if cyc["exec_status"] == STATUS["reviewing"]:
+                needs_review = (
+                    (cyc["review_plan_end"] and cyc["review_plan_end"] <= today)
+                    or (cyc["review_plan_end"] and cyc["review_plan_end"] == tomorrow)
+                )
+                if needs_review:
+                    result[name]["review_cycles"].append(cyc)
+
+    # Remove executors with no pending cycles
+    return {k: v for k, v in result.items() if v["exec_cycles"] or v["review_cycles"]}
+
+
+def build_review_reminder(cycle: dict) -> str:
+    """Build an HTML review reminder email for a reviewer."""
+    cid  = cycle.get("cycle_id", "")
+    name = cycle.get("cycle_name", "")
+    rpe  = cycle.get("review_plan_end")
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:700px">
+    <h2 style="color:#1565c0">🔍 Review Reminder — {cid}</h2>
+    <p style="font-size:14px">
+      Test cycle <b>{cid} — {name}</b> has completed execution and is awaiting review.
+      {"Planned review deadline: <b>" + str(rpe) + "</b>.<br>" if rpe else ""}
+      <br>
+      Please review the condition script, verify the test evidence,
+      and enter the review completion date once done.
+    </p>
+    <p style="font-size:13px;color:gray">
+      This is an automated reminder from the SAP Test Management system.<br>
+      Please do not reply to this email.
+    </p>
+    </div>"""
+
+
+def build_remark_reminder(cycle: dict) -> str:
+    """Build an HTML reminder to fill in remarks/notes in the condition script."""
+    cid  = cycle.get("cycle_id", "")
+    name = cycle.get("cycle_name", "")
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:700px">
+    <h2 style="color:#6a1b9a">📝 Remark Filling Reminder — {cid}</h2>
+    <p style="font-size:14px">
+      Please make sure all remarks and notes are filled in for test cycle
+      <b>{cid} — {name}</b> in the condition script.<br><br>
+      Remarks help reviewers understand the test context and any issues encountered.
+    </p>
+    <p style="font-size:13px;color:gray">
+      This is an automated reminder from the SAP Test Management system.<br>
+      Please do not reply to this email.
+    </p>
+    </div>"""
 
 
 # ─────────────────────────────────────────────────────────────
